@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -12,7 +13,10 @@
 #include "ui/screens.h"
 #include "stc8h1k28.h"
 #include "driver/uart.h"
+
+extern "C" {
 #include "hmi_ui_sync.h"
+}
 
 #define MARLIN_UART_NUM      UART_NUM_1
 #define MARLIN_TX_PIN        GPIO_NUM_20
@@ -26,11 +30,6 @@
 #define MAX_FILES            50
 #define FILE_NAME_LEN        64
 
-extern "C" {
-#include "hmi_ui_sync.h"
-}
-
-
 static const char *TAG = "MARLIN_HMI";
 
 static void update_file_browser_ui(void);
@@ -40,6 +39,54 @@ static bool s_printing = false;
 static int64_t s_start_us = 0;
 
 static bool s_is_paused = false;
+
+// Temperature & heating state tracking for M105 polling during heat-up
+static float s_nozzle_current = 0.0f;
+static float s_nozzle_target  = 0.0f;
+static float s_bed_current    = 0.0f;
+static float s_bed_target     = 0.0f;
+static bool s_heating_active  = false;
+static uint8_t s_m27_busy_backoff = 0;
+static bool s_boot_usb_synced = false;
+
+static bool is_heating(void) {
+    if (s_heating_active) {
+        return true;
+    }
+    const float margin = 3.0f;
+    bool nozzle_heating = (s_nozzle_target > 30.0f) && (s_nozzle_current < s_nozzle_target - margin);
+    bool bed_heating    = (s_bed_target    > 30.0f) && (s_bed_current    < s_bed_target    - margin);
+    return nozzle_heating || bed_heating;
+}
+
+static void record_outbound_temp_cmd(const char *command) {
+    if (!command) return;
+
+    const char *s_param = strstr(command, "S");
+    float val = s_param ? strtof(s_param + 1, NULL) : 0.0f;
+
+    if (strncmp(command, "M104", 4) == 0) {
+        s_nozzle_target = val;
+        if (val <= 1.0f) {
+            s_heating_active = false;
+        }
+    } else if (strncmp(command, "M109", 4) == 0) {
+        s_nozzle_target = val;
+        if (val > 30.0f) {
+            s_heating_active = true;
+        }
+    } else if (strncmp(command, "M140", 4) == 0) {
+        s_bed_target = val;
+        if (val <= 1.0f) {
+            s_heating_active = false;
+        }
+    } else if (strncmp(command, "M190", 4) == 0) {
+        s_bed_target = val;
+        if (val > 30.0f) {
+            s_heating_active = true;
+        }
+    }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -99,39 +146,82 @@ void ui_set_print_active(bool active) {
 
 void ui_update_print_times(uint32_t cur_bytes, uint32_t total_bytes) {
     if (!s_printing || total_bytes == 0) {
-        lv_label_set_text(objects.time_elapsed, "0h 00m");
-        lv_label_set_text(objects.time_remaining, "--");
+        if (objects.time_elapsed) {
+            lv_label_set_text(objects.time_elapsed, "0h 00m");
+        }
+        if (objects.time_remaining) {
+            lv_label_set_text(objects.time_remaining, "--");
+        }
         return;
     }
 
     uint32_t elapsed_s = (uint32_t)((esp_timer_get_time() - s_start_us) / 1000000ULL);
-    lv_label_set_text_fmt(objects.time_elapsed, "%luh %02lum", elapsed_s / 3600U, (elapsed_s % 3600U) / 60U);
+    if (objects.time_elapsed) {
+        lv_label_set_text_fmt(objects.time_elapsed, "%luh %02lum", elapsed_s / 3600U, (elapsed_s % 3600U) / 60U);
+    }
 
     // Wait until at least 30s and 2% progress before estimating remaining time
-    if (cur_bytes > 0 && cur_bytes < total_bytes && elapsed_s >= 30 && (cur_bytes * 50ULL) >= total_bytes) {
-        uint64_t rem_s = ((uint64_t)elapsed_s * (total_bytes - cur_bytes)) / cur_bytes;
-        lv_label_set_text_fmt(objects.time_remaining, "%luh %02lum", (uint32_t)(rem_s / 3600U), (uint32_t)((rem_s % 3600U) / 60U));
-    } else if (cur_bytes >= total_bytes) {
-        lv_label_set_text(objects.time_remaining, "0h 00m");
-    } else {
-        lv_label_set_text(objects.time_remaining, "--");
+    if (objects.time_remaining) {
+        if (cur_bytes > 0 && cur_bytes < total_bytes && elapsed_s >= 30 && (cur_bytes * 50ULL) >= total_bytes) {
+            uint64_t rem_s = ((uint64_t)elapsed_s * (total_bytes - cur_bytes)) / cur_bytes;
+            lv_label_set_text_fmt(objects.time_remaining, "%luh %02lum", (uint32_t)(rem_s / 3600U), (uint32_t)((rem_s % 3600U) / 60U));
+        } else if (cur_bytes >= total_bytes) {
+            lv_label_set_text(objects.time_remaining, "0h 00m");
+        } else {
+            lv_label_set_text(objects.time_remaining, "--");
+        }
     }
 }
 
-
 void ui_set_fan_pwm(uint8_t pwm) {
     int pct = ((int)pwm * 100 + 127) / 255;
-    lv_slider_set_value(objects.fan_speed_slider_print_screen, pct, LV_ANIM_OFF);
-    lv_label_set_text_fmt(objects.fan_speed_percentage, "%d%%", pct);
+    if (objects.fan_speed_slider_print_screen) {
+        lv_slider_set_value(objects.fan_speed_slider_print_screen, pct, LV_ANIM_OFF);
+    }
+    if (objects.fan_speed_percentage) {
+        lv_label_set_text_fmt(objects.fan_speed_percentage, "%d%%", pct);
+    }
 }
 
+static void parse_fan_telemetry(const char *line) {
+    if (!line) return;
 
+    // Match "M106 ... S<0-255>" (e.g. "M106 S128" or "echo:M106 P0 S128")
+    const char *m106 = strstr(line, "M106");
+    if (m106) {
+        const char *s_pos = strstr(m106, "S");
+        if (s_pos) {
+            int pwm = atoi(s_pos + 1);
+            if (pwm < 0) pwm = 0;
+            if (pwm > 255) pwm = 255;
+            ui_set_fan_pwm((uint8_t)pwm);
+            return;
+        }
+    }
 
+    // Fallback for fan lines containing "<num>%"
+    if (strstr(line, "fan") != NULL || strstr(line, "Fan") != NULL) {
+        const char *pct_pos = strchr(line, '%');
+        if (pct_pos && pct_pos > line) {
+            const char *p = pct_pos - 1;
+            while (p > line && ((*p >= '0' && *p <= '9') || *p == ' ')) {
+                p--;
+            }
+            int pct = atoi(p);
+            if (pct >= 0 && pct <= 100) {
+                uint8_t pwm = (uint8_t)((pct * 255 + 50) / 100);
+                ui_set_fan_pwm(pwm);
+            }
+        }
+    }
+}
 
 // ─── G-code send ─────────────────────────────────────────────────────────────
 
 extern "C" void send_gcode(const char *command) {
     if (!command || command[0] == '\0') return;
+    record_outbound_temp_cmd(command);
+
     if (marlin_cmd_queue != NULL) {
         xQueueSend(marlin_cmd_queue, command, pdMS_TO_TICKS(50));
     }
@@ -139,6 +229,41 @@ extern "C" void send_gcode(const char *command) {
         log_item_t item;
         snprintf(item.line, LOG_LINE_MAX, "> %s", command);
         xQueueSend(log_queue, &item, 0);
+    }
+}
+
+static void request_usb_file_list(void) {
+    send_gcode("M22 U");
+    vTaskDelay(pdMS_TO_TICKS(150));
+    send_gcode("M21 U");
+    vTaskDelay(pdMS_TO_TICKS(150));
+    send_gcode("M20 L");
+}
+
+// ─── UI callbacks ────────────────────────────────────────────────────────────
+
+static void fan_slider_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_VALUE_CHANGED && code != LV_EVENT_RELEASED) {
+        return;
+    }
+
+    lv_obj_t *slider = lv_event_get_target(e);
+    if (!slider) return;
+
+    int pct = (int)lv_slider_get_value(slider);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    if (objects.fan_speed_percentage) {
+        lv_label_set_text_fmt(objects.fan_speed_percentage, "%d%%", pct);
+    }
+
+    if (code == LV_EVENT_RELEASED) {
+        int pwm = (pct * 255 + 50) / 100;
+        char cmd[MAX_GCODE_LEN];
+        snprintf(cmd, sizeof(cmd), "M106 S%d", pwm);
+        send_gcode(cmd);
     }
 }
 
@@ -166,6 +291,8 @@ static void confirm_print_cb(lv_event_t *e) {
         print_bytes_total = 0;
         snprintf(current_job, sizeof(current_job), "%s", pending_filename);
         isPrinting = true;
+        s_is_paused = false;
+        ui_set_print_active(true);
 
         ESP_LOGI(TAG, "Start print selected: '%s'", current_job);
 
@@ -219,6 +346,38 @@ static void file_browser_click_cb(lv_event_t *e) {
 void parse_marlin_line(const char *line) {
     if (line == NULL || line[0] == '\0') return;
 
+    if (strstr(line, "External Reset") != NULL) {
+        s_boot_usb_synced = false;
+        isPrinting = false;
+        s_is_paused = false;
+        s_heating_active = false;
+        print_bytes_current = 0;
+        print_bytes_total = 0;
+        ui_set_print_active(false);
+        ESP_LOGI(TAG, "Marlin External Reset detected -> will re-sync USB file list");
+    }
+
+    // Back off M27/M114 polling temporarily when Marlin reports busy (e.g., M190/M109/G28)
+    if (strstr(line, "echo:busy: processing") != NULL) {
+        if (s_m27_busy_backoff < 3) {
+            s_m27_busy_backoff = 3;
+        }
+        return;
+    }
+
+    // Track heating & pause notifications from Marlin
+    if (strstr(line, "//action:notification") != NULL) {
+        if (strstr(line, "Heating") != NULL) {
+            s_heating_active = true;
+            s_is_paused = false;
+        }
+        if (strstr(line, "Print Paused") != NULL) {
+            s_is_paused = true;
+        } else if (strstr(line, "Resuming") != NULL || strstr(line, "Resume") != NULL) {
+            s_is_paused = false;
+        }
+    }
+
     // M27 progress: "SD printing byte 123456/7829494"
     if (strncmp(line, "SD printing byte ", 17) == 0) {
         unsigned long cur = 0, tot = 0;
@@ -227,6 +386,8 @@ void parse_marlin_line(const char *line) {
             print_bytes_total = (uint32_t)tot;
             if (tot > 0) {
                 isPrinting = true;
+                s_is_paused = false;
+                ui_set_print_active(true);
             }
             ESP_LOGI(TAG, "M27 progress: %lu / %lu", cur, tot);
         }
@@ -261,16 +422,22 @@ void parse_marlin_line(const char *line) {
     // Print start / completion detection
     if (strstr(line, "Start SD print job:") != NULL) {
         isPrinting = true;
+        s_is_paused = false;
+        ui_set_print_active(true);
         ESP_LOGI(TAG, "Marlin confirmed SD print start");
     }
     if (strstr(line, "Done printing file") != NULL || strstr(line, "Not SD printing") != NULL) {
         isPrinting = false;
+        s_is_paused = false;
+        s_heating_active = false;
         print_bytes_current = 0;
         print_bytes_total = 0;
+        ui_set_print_active(false);
         ESP_LOGI(TAG, "Marlin reported print ended/inactive");
     }
 
-    // Coordinate updates
+    parse_fan_telemetry(line);
+
     // Coordinate updates (main screen + print screen)
     char coord_buf[16];
     const char *xPos = strstr(line, "X:");
@@ -316,48 +483,83 @@ void parse_marlin_line(const char *line) {
     float dcur = -1.0f;
     char buf[16];
 
-const char *tPos = strstr(line, "T:");
-    if (tPos && (tPos == line || tPos[-1] == ' ') && sscanf(tPos, "T:%f /%f", &hcur, &hset) >= 1 && hcur >= 0.0f) {
-        if (objects.nozzle_temp_main_screen) {
-            snprintf(buf, sizeof(buf), "%.0f°", hcur);
-            lv_label_set_text(objects.nozzle_temp_main_screen, buf);
-        }
-        if (objects.nozzle_arc_temp_print_screen) {
-            snprintf(buf, sizeof(buf), "%.0f°", hcur);
-            lv_label_set_text(objects.nozzle_arc_temp_print_screen, buf);
-        }
-        if (hset >= 0.0f && !ui_should_ignore_nozzle_sync()) {
-            if (objects.nozzle_arc) {
-                lv_arc_set_value(objects.nozzle_arc, (int32_t)hset);
+    const char *tPos = strstr(line, "T:");
+    if (tPos && (tPos == line || tPos[-1] == ' ')) {
+        // Accept both "T:xx /yy" and "T:xx/yy"
+        if (sscanf(tPos, "T:%f /%f", &hcur, &hset) >= 1 ||
+            sscanf(tPos, "T:%f/%f",  &hcur, &hset) >= 1) {
+
+            if (hcur >= 0.0f) {
+                s_nozzle_current = hcur;
+
+                if (objects.nozzle_temp_main_screen) {
+                    snprintf(buf, sizeof(buf), "%.0f°", hcur);
+                    lv_label_set_text(objects.nozzle_temp_main_screen, buf);
+                }
+                if (objects.nozzle_arc_temp_print_screen) {
+                    snprintf(buf, sizeof(buf), "%.0f°", hcur);
+                    lv_label_set_text(objects.nozzle_arc_temp_print_screen, buf);
+                }
             }
-            if (objects.nozzle_arc_target_print_screen) {
-                snprintf(buf, sizeof(buf), "%.0f°", hset);
-                lv_label_set_text(objects.nozzle_arc_target_print_screen, buf);
+
+            if (hset >= 0.0f) {
+                s_nozzle_target = hset;
+
+                if (!ui_should_ignore_nozzle_sync()) {
+                    if (objects.nozzle_arc) {
+                        lv_arc_set_value(objects.nozzle_arc, (int32_t)hset);
+                    }
+                    if (objects.nozzle_arc_target_print_screen) {
+                        snprintf(buf, sizeof(buf), "%.0f°", hset);
+                        lv_label_set_text(objects.nozzle_arc_target_print_screen, buf);
+                    }
+                }
             }
         }
     }
 
     const char *bPos = strstr(line, "B:");
-    if (bPos && (bPos == line || bPos[-1] == ' ') && sscanf(bPos, "B:%f /%f", &bcur, &bset) >= 1 && bcur >= 0.0f) {
-        if (objects.bed_temp_main_screen) {
-            snprintf(buf, sizeof(buf), "%.0f°", bcur);
-            lv_label_set_text(objects.bed_temp_main_screen, buf);
-        }
-        if (objects.bed_arc_temp_print_screen) {
-            snprintf(buf, sizeof(buf), "%.0f°", bcur);
-            lv_label_set_text(objects.bed_arc_temp_print_screen, buf);
-        }
-        if (bset >= 0.0f && !ui_should_ignore_bed_sync()) {
-            if (objects.bed_arc) {
-                lv_arc_set_value(objects.bed_arc, (int32_t)bset);
+    if (bPos && (bPos == line || bPos[-1] == ' ')) {
+        if (sscanf(bPos, "B:%f /%f", &bcur, &bset) >= 1 ||
+            sscanf(bPos, "B:%f/%f",  &bcur, &bset) >= 1) {
+
+            if (bcur >= 0.0f) {
+                s_bed_current = bcur;
+
+                if (objects.bed_temp_main_screen) {
+                    snprintf(buf, sizeof(buf), "%.0f°", bcur);
+                    lv_label_set_text(objects.bed_temp_main_screen, buf);
+                }
+                if (objects.bed_arc_temp_print_screen) {
+                    snprintf(buf, sizeof(buf), "%.0f°", bcur);
+                    lv_label_set_text(objects.bed_arc_temp_print_screen, buf);
+                }
             }
-            if (objects.bed_arc_target_print_screen) {
-                snprintf(buf, sizeof(buf), "%.0f°", bset);
-                lv_label_set_text(objects.bed_arc_target_print_screen, buf);
+
+            if (bset >= 0.0f) {
+                s_bed_target = bset;
+
+                if (!ui_should_ignore_bed_sync()) {
+                    if (objects.bed_arc) {
+                        lv_arc_set_value(objects.bed_arc, (int32_t)bset);
+                    }
+                    if (objects.bed_arc_target_print_screen) {
+                        snprintf(buf, sizeof(buf), "%.0f°", bset);
+                        lv_label_set_text(objects.bed_arc_target_print_screen, buf);
+                    }
+                }
             }
         }
     }
 
+    // Clear explicit heating latch once current temps are within 3C of active targets (or targets are 0)
+    bool nozzle_done = (s_nozzle_target <= 30.0f) || (s_nozzle_current >= s_nozzle_target - 3.0f);
+    bool bed_done    = (s_bed_target    <= 30.0f) || (s_bed_current    >= s_bed_target    - 3.0f);
+    if ((tPos || bPos) && nozzle_done && bed_done) {
+        s_heating_active = false;
+    }
+
+    // Chamber / drivers temp
     const char *cPos = strstr(line, "C:");
     if (cPos && (cPos == line || cPos[-1] == ' ') && sscanf(cPos, "C:%f", &dcur) == 1 && dcur >= 0.0f) {
         if (objects.drivers_temp_main_screen) {
@@ -414,7 +616,7 @@ static void marlin_rx_task(void *arg) {
                     line_accumulator[line_pos] = '\0';
                     if (line_pos > 0) {
                         ESP_LOGI(TAG, "UART1 RX: %s", line_accumulator);
-                        if (lvgl_port_lock(-1)) {
+                        if (lvgl_port_lock(100)) {
                             parse_marlin_line(line_accumulator);
 
                             if (strstr(line_accumulator, "T:") == NULL &&
@@ -440,13 +642,42 @@ static void marlin_rx_task(void *arg) {
 
 static void watchdog_task(void *arg) {
     (void)arg;
+    uint8_t poll_counter = 0;
+
     while (1) {
         uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (marlin_connected && (now_ms - last_marlin_reply_ms > 8000)) {
+
+        if (marlin_connected && !s_boot_usb_synced) {
+            s_boot_usb_synced = true;
+            request_usb_file_list();
+        }
+
+        // Connection watchdog
+        if (marlin_connected && (now_ms - last_marlin_reply_ms > 10000)) {
             marlin_connected = false;
             ESP_LOGI(TAG, "Watchdog timeout -> polling M105");
             send_gcode("M105");
         }
+
+        // Regular temperature polling
+        poll_counter++;
+
+        if (is_heating()) {
+            // While heating -> poll every 2 seconds
+            if (poll_counter >= 2) {
+                poll_counter = 0;
+                send_gcode("M105");
+            }
+        } else if (isPrinting || marlin_connected) {
+            // While printing or just connected -> poll every 3 seconds
+            if (poll_counter >= 3) {
+                poll_counter = 0;
+                send_gcode("M105");
+            }
+        } else {
+            poll_counter = 0;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -456,8 +687,10 @@ static void watchdog_task(void *arg) {
 static void update_print_screen_timer(lv_timer_t *timer) {
     (void)timer;
 
-    const char *status_text = isPrinting ? "PRINTING" : "READY";
-    lv_color_t status_color = isPrinting ? lv_color_hex(0x00D2FF) : lv_color_hex(0x00FF88);
+    const char *status_text = isPrinting ? (s_is_paused ? "PAUSED" : "PRINTING") : "READY";
+    lv_color_t status_color = isPrinting
+        ? (s_is_paused ? lv_color_hex(0xFFB300) : lv_color_hex(0x00D2FF))
+        : lv_color_hex(0x00FF88);
 
     if (objects.print_ready_label_main_screen) {
         lv_label_set_text(objects.print_ready_label_main_screen, status_text);
@@ -473,15 +706,19 @@ static void update_print_screen_timer(lv_timer_t *timer) {
     }
 
     if (!isPrinting) {
+        ui_update_print_times(0, 0);
         return;
     }
 
-    // Poll M27 every 2 seconds (timer fires every 1000 ms)
-    static uint8_t m27_tick = 0;
-    m27_tick++;
-    if ((m27_tick % 2) == 0) {
-        ESP_LOGI(TAG, "Poll M27 for '%s'", current_job);
+    // Poll M27 and M114 while printing, backing off when Marlin reports busy
+    static uint8_t poll_tick = 0;
+    poll_tick++;
+    if (s_m27_busy_backoff > 0) {
+        s_m27_busy_backoff--;
+    } else if ((poll_tick % 6) == 3) {
         send_gcode("M27");
+    } else if ((poll_tick % 6) == 0) {
+        send_gcode("M114");
     }
 
     int pct = 0;
@@ -500,6 +737,8 @@ static void update_print_screen_timer(lv_timer_t *timer) {
     if (objects.printing_progress_slider_print_screen) {
         lv_slider_set_value(objects.printing_progress_slider_print_screen, pct, LV_ANIM_OFF);
     }
+
+    ui_update_print_times(print_bytes_current, print_bytes_total);
 }
 
 // ─── App main ────────────────────────────────────────────────────────────────
@@ -534,8 +773,8 @@ extern "C" void app_main(void) {
     uart_param_config(MARLIN_UART_NUM, &uart_config);
     uart_set_pin(MARLIN_UART_NUM, MARLIN_TX_PIN, MARLIN_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(MARLIN_UART_NUM, SERIAL_BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_flush_input(MARLIN_UART_NUM); 
-	log_queue_init();
+    uart_flush_input(MARLIN_UART_NUM);
+    log_queue_init();
     marlin_cmd_queue = xQueueCreate(COMMAND_QUEUE_LEN, MAX_GCODE_LEN);
 
     if (lvgl_port_lock(portMAX_DELAY)) {
@@ -545,6 +784,9 @@ extern "C" void app_main(void) {
         }
         if (objects.file_browser_list) {
             lv_obj_add_event_cb(objects.file_browser_list, file_browser_click_cb, LV_EVENT_CLICKED, NULL);
+        }
+        if (objects.fan_speed_slider_print_screen) {
+            lv_obj_add_event_cb(objects.fan_speed_slider_print_screen, fan_slider_event_cb, LV_EVENT_ALL, NULL);
         }
         lv_timer_create(update_clock_labels_timer, 1000, NULL);
         lv_timer_create(update_print_screen_timer, 1000, NULL);
@@ -557,13 +799,7 @@ extern "C" void app_main(void) {
 
     vTaskDelay(pdMS_TO_TICKS(1500));
 
+    // Enable auto-report (primary method)
     send_gcode("M155 S2");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    send_gcode("M22");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    send_gcode("M21");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    send_gcode("M20 L");
-	vTaskDelay(pdMS_TO_TICKS(100));
-    send_gcode("M21 U\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
 }

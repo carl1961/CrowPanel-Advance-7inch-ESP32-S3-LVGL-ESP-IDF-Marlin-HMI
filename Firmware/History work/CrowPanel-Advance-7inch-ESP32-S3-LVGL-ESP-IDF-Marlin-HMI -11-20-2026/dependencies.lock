@@ -1,0 +1,17 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 5.5.4
+  lvgl:
+    dependencies: []
+    source:
+      path: C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\components\lvgl
+      type: local
+    version: 8.4.0
+direct_dependencies:
+- idf
+- lvgl/lvgl
+manifest_hash: d2a9f51a2b16c9af19c453ac1de6c43716322e5434d3093bf60ee20f4c482d9e
+target: esp32s3
+version: 2.0.0

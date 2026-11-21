@@ -1161,7 +1161,8 @@ void create_screen_print_screen() {
             lv_obj_t *obj = lv_label_create(parent_obj);
             objects.job_label_print_screen = obj;
             lv_obj_set_pos(obj, 308, 6);
-            lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_set_size(obj, 246, 24);
+            lv_label_set_long_mode(obj, LV_LABEL_LONG_SCROLL_CIRCULAR);
             lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_ON);
             lv_obj_set_scroll_dir(obj, LV_DIR_LEFT);
             lv_obj_set_scroll_snap_x(obj, LV_SCROLL_SNAP_START);
@@ -1169,7 +1170,7 @@ void create_screen_print_screen() {
             add_style_cyan_2(obj);
             lv_obj_set_style_text_font(obj, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_color(obj, lv_color_darken(lv_color_hex(0xfaf8f8), 64), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_label_set_text(obj, "Project.gcode");
+            lv_label_set_text_static(obj, "Project.gcode");
         }
         {
             // WifiIconLabelPrintScreen
@@ -1401,7 +1402,7 @@ void create_screen_print_screen() {
                     lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_set_style_text_color(obj, lv_color_hex(0x00f4ff), LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_set_style_text_font(obj, &ui_font_montserrat_bold_14, LV_PART_MAIN | LV_STATE_DEFAULT);
-                    lv_label_set_text_static(obj, "???");
+                    lv_label_set_text_static(obj, "SAVE");
                 }
             }
         }
@@ -1426,7 +1427,7 @@ void create_screen_print_screen() {
                     lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_set_style_text_color(obj, lv_color_hex(0xfba002), LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_set_style_text_font(obj, &ui_font_montserrat_bold_14, LV_PART_MAIN | LV_STATE_DEFAULT);
-                    lv_label_set_text_static(obj, "???");
+                    lv_label_set_text_static(obj, "APPLY");
                 }
             }
         }

@@ -6172,8 +6172,8 @@
               "type": "LVGLLabelWidget",
               "left": 308,
               "top": 6,
-              "width": 113,
-              "height": 18,
+              "width": 246,
+              "height": 24,
               "customInputs": [],
               "customOutputs": [],
               "style": {
@@ -6187,8 +6187,8 @@
               "identifier": "JobLabelPrintScreen",
               "leftUnit": "px",
               "topUnit": "px",
-              "widthUnit": "content",
-              "heightUnit": "content",
+              "widthUnit": "px",
+              "heightUnit": "px",
               "children": [],
               "widgetFlags": "CLICK_FOCUSABLE|GESTURE_BUBBLE|PRESS_LOCK|SCROLLABLE|SCROLL_CHAIN_HOR|SCROLL_CHAIN_VER|SCROLL_ELASTIC|SCROLL_MOMENTUM|SCROLL_WITH_ARROW|SNAPPABLE",
               "hiddenFlagType": "literal",
@@ -6216,9 +6216,9 @@
               "groupIndex": 0,
               "text": "Project.gcode",
               "textType": "literal",
-              "longMode": "WRAP",
+              "longMode": "SCROLL_CIRCULAR",
               "recolor": false,
-              "useStaticText": false
+              "useStaticText": true
             },
             {
               "objID": "ecd8dba8-ac19-4c94-f22f-7bd5e794b783",
@@ -7165,7 +7165,7 @@
                   "type": "LVGLLabelWidget",
                   "left": 0,
                   "top": 0,
-                  "width": 24,
+                  "width": 39,
                   "height": 16,
                   "customInputs": [],
                   "customOutputs": [],
@@ -7206,7 +7206,7 @@
                   },
                   "group": "",
                   "groupIndex": 0,
-                  "text": "???",
+                  "text": "SAVE",
                   "textType": "literal",
                   "longMode": "WRAP",
                   "recolor": false,
@@ -7270,7 +7270,7 @@
                   "type": "LVGLLabelWidget",
                   "left": 0,
                   "top": 0,
-                  "width": 24,
+                  "width": 48,
                   "height": 16,
                   "customInputs": [],
                   "customOutputs": [],
@@ -7311,7 +7311,7 @@
                   },
                   "group": "",
                   "groupIndex": 0,
-                  "text": "???",
+                  "text": "APPLY",
                   "textType": "literal",
                   "longMode": "WRAP",
                   "recolor": false,
@@ -21420,6 +21420,7 @@
                     "conditionalStyles": [],
                     "childStyles": []
                   },
+                  "hiddenInEditor": false,
                   "timeline": [],
                   "eventHandlers": [],
                   "leftUnit": "px",
@@ -21503,6 +21504,7 @@
                 "conditionalStyles": [],
                 "childStyles": []
               },
+              "hiddenInEditor": false,
               "timeline": [],
               "eventHandlers": [],
               "identifier": "",
@@ -21559,6 +21561,7 @@
                 "conditionalStyles": [],
                 "childStyles": []
               },
+              "hiddenInEditor": false,
               "timeline": [],
               "eventHandlers": [],
               "leftUnit": "px",
@@ -21817,6 +21820,7 @@
                 "conditionalStyles": [],
                 "childStyles": []
               },
+              "hiddenInEditor": false,
               "timeline": [],
               "eventHandlers": [],
               "identifier": "RetractButtonFilamentChangeScreen",
@@ -21840,6 +21844,7 @@
                     "conditionalStyles": [],
                     "childStyles": []
                   },
+                  "hiddenInEditor": false,
                   "timeline": [],
                   "eventHandlers": [],
                   "leftUnit": "px",
@@ -21912,6 +21917,7 @@
                 "conditionalStyles": [],
                 "childStyles": []
               },
+              "hiddenInEditor": false,
               "timeline": [],
               "eventHandlers": [],
               "identifier": "ExtrudeButtonFilamentChangeScreen",
@@ -21935,6 +21941,7 @@
                     "conditionalStyles": [],
                     "childStyles": []
                   },
+                  "hiddenInEditor": false,
                   "timeline": [],
                   "eventHandlers": [],
                   "leftUnit": "px",
@@ -40551,64 +40558,10 @@
               "heightUnit": "px",
               "children": [
                 {
-                  "objID": "85074d03-8a17-4909-c37b-6b5b86bbdc57",
-                  "type": "LVGLLabelWidget",
-                  "left": 124,
-                  "top": 26,
-                  "width": 75,
-                  "height": 21,
-                  "customInputs": [],
-                  "customOutputs": [],
-                  "style": {
-                    "objID": "27d63eb1-14f9-4282-9a84-20dda0de2d65",
-                    "useStyle": "default",
-                    "conditionalStyles": [],
-                    "childStyles": []
-                  },
-                  "timeline": [],
-                  "eventHandlers": [],
-                  "identifier": "Print_ReadyLabelPrintScreen_1",
-                  "leftUnit": "px",
-                  "topUnit": "px",
-                  "widthUnit": "content",
-                  "heightUnit": "content",
-                  "children": [],
-                  "widgetFlags": "CLICK_FOCUSABLE|GESTURE_BUBBLE|PRESS_LOCK|SCROLLABLE|SCROLL_CHAIN_HOR|SCROLL_CHAIN_VER|SCROLL_ELASTIC|SCROLL_MOMENTUM|SCROLL_WITH_ARROW|SNAPPABLE",
-                  "hiddenFlagType": "literal",
-                  "clickableFlagType": "literal",
-                  "flagScrollbarMode": "",
-                  "flagScrollDirection": "",
-                  "scrollSnapX": "",
-                  "scrollSnapY": "",
-                  "checkedStateType": "literal",
-                  "disabledStateType": "literal",
-                  "states": "",
-                  "useStyle": "Cyan_2",
-                  "localStyles": {
-                    "objID": "27995735-152f-423d-ccd5-ee504e334742",
-                    "definition": {
-                      "MAIN": {
-                        "DEFAULT": {
-                          "text_font": "Montserrat-Extra-Bold-20",
-                          "text_align": "CENTER",
-                          "text_color": "#00f4ff"
-                        }
-                      }
-                    }
-                  },
-                  "group": "",
-                  "groupIndex": 0,
-                  "text": "READY",
-                  "textType": "literal",
-                  "longMode": "WRAP",
-                  "recolor": false,
-                  "useStaticText": false
-                },
-                {
                   "objID": "4c22f233-a7df-4bdd-b275-5030c34e93ab",
                   "type": "LVGLLabelWidget",
-                  "left": 288,
-                  "top": 10,
+                  "left": 102,
+                  "top": 16,
                   "width": 187,
                   "height": 23,
                   "customInputs": [],

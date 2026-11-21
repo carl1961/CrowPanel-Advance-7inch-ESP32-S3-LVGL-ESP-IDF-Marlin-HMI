@@ -1,6 +1,6 @@
 {
   "navigation": {
-    "selectedUserPageObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/1",
+    "selectedUserPageObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/5",
     "selectedActionObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/actions/68",
     "selectedStyleObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/lvglStyles/styles/12",
     "selectedFontObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/fonts/17",
@@ -170,7 +170,8 @@
                       "enableClose": false,
                       "icon": "svg:hierarchy"
                     }
-                  ]
+                  ],
+                  "active": true
                 },
                 {
                   "type": "tabset",
@@ -200,16 +201,15 @@
                 {
                   "type": "tab",
                   "id": "#dc00b1b3-a0e9-4aef-a707-9fa76766da81",
-                  "name": "Print_Screen",
+                  "name": "FilamentChangeScreen",
                   "component": "editor",
                   "config": {
-                    "objectPath": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/1",
+                    "objectPath": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/5",
                     "permanent": false
                   },
                   "icon": "svg:page"
                 }
-              ],
-              "active": true
+              ]
             },
             {
               "type": "row",
@@ -1103,7 +1103,7 @@
       "transform": {
         "translate": {
           "x": -406.28631591796875,
-          "y": -223.36003123911382
+          "y": -332.9045410156249
         },
         "scale": 1
       },
@@ -1121,7 +1121,9 @@
           "0": {
             "0": {}
           },
-          "1": {},
+          "1": {
+            "$selected": true
+          },
           "2": {},
           "3": {},
           "4": {},
@@ -1150,7 +1152,7 @@
       "transform": {
         "translate": {
           "x": -402.09552001953125,
-          "y": -329.8749229845192
+          "y": -439.41943276103024
         },
         "scale": 1
       },
@@ -1205,14 +1207,7 @@
           "5": {},
           "6": {},
           "7": {},
-          "8": {},
-          "9": {},
-          "10": {
-            "12": {},
-            "16": {}
-          },
-          "11": {},
-          "12": {}
+          "8": {}
         }
       },
       "transform": {
@@ -1256,7 +1251,9 @@
       "selectionBack": {
         "0": {
           "0": {},
-          "2": {},
+          "2": {
+            "$selected": true
+          },
           "14": {},
           "15": {},
           "16": {},
@@ -1375,9 +1372,7 @@
       "selectionFront": {},
       "selectionBack": {
         "0": {
-          "3": {
-            "16": {}
-          },
+          "3": {},
           "5": {},
           "6": {}
         }
@@ -1410,9 +1405,7 @@
       "selectionFront": {},
       "selectionBack": {
         "0": {
-          "0": {
-            "$selected": true
-          }
+          "0": {}
         }
       },
       "transform": {
@@ -1439,9 +1432,7 @@
           "1": {},
           "6": {},
           "7": {},
-          "10": {
-            "$selected": true
-          },
+          "10": {},
           "11": {}
         }
       },
@@ -1516,7 +1507,9 @@
         "0": {
           "0": {},
           "23": {
-            "$selected": true
+            "0": {
+              "$selected": true
+            }
           }
         }
       },
@@ -1548,8 +1541,8 @@
   "showComponentDescriptions": true,
   "logsPanelFilter": "all",
   "selectedStylePropertyName": "",
-  "lvglPart": "KNOB",
-  "lvglState": "CHECKED|PRESSED",
+  "lvglPart": "MAIN",
+  "lvglState": "DEFAULT",
   "lvglExpandedPropertiesGroup": [
     "TEXT",
     "BACKGROUND",
