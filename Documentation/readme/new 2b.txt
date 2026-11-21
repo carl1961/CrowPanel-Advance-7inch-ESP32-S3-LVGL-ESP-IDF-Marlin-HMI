@@ -1,0 +1,22 @@
+lv_obj_t *nozzle_arc;
+lv_obj_t *bed_arc;
+lv_obj_t *nozzle_arc_temp_print_screen;
+lv_obj_t *bed_arc_temp_print_screen;
+lv_obj_t *bed_arc_target_print_screen;
+lv_obj_t *nozzle_arc_target_print_screen;
+
+
+
+
+
+lv_obj_t *nozzle_arc_1;
+lv_obj_t *bed_arc_1;
+lv_obj_t *nozzle_arc_temp_print_screen_1;
+    lv_obj_t *obj414;
+    lv_obj_t *obj415;
+    lv_obj_t *obj416;
+    lv_obj_t *obj417;
+    lv_obj_t *bed_arc_temp_print_screen_1;
+    lv_obj_t *obj418;
+    lv_obj_t *bed_arc_target_print_screen_1;
+    lv_obj_t *nozzle_arc_target_print_screen_1;

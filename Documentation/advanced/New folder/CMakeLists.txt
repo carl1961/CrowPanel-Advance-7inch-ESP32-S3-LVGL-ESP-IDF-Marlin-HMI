@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS 
+        "main.cpp"
+        "gui/gui.c"
+        "display/esp32_s3.c"
+        "task/time_task.c"
+    INCLUDE_DIRS 
+        "."
+        "gui"
+        "display"
+        "task"
+        "ui"
+)
