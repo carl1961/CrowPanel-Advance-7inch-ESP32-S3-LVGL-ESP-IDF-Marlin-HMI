@@ -1,0 +1,42 @@
+if (log_queue != NULL) {
+    char batch[1024] = {0};
+    size_t batch_len = 0;
+    log_item_t item;
+
+    while (xQueueReceive(log_queue, &item, 0) == pdTRUE) {
+        if (strncmp(item.line, "LIST_ADD:", 9) == 0) {
+    if (objects.file_browser_list) {
+        lv_obj_t *btn = lv_btn_create(objects.file_browser_list);
+        lv_obj_set_width(btn, LV_PCT(100));
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, item.line + 9);
+        lv_obj_center(label);
+    }
+}  
+ 
+        } else { if (strcmp(item.line, "LIST_CLEAR") == 0) {
+            if (objects.file_browser_list) {
+                lv_obj_clean(objects.file_browser_list);
+            }
+        } else {
+            if (batch_len < sizeof(batch) - 128) {
+                batch_len += snprintf(batch + batch_len, sizeof(batch) - batch_len, "%s\n", item.line);
+            }
+        }
+    }
+
+    // ONE set_text per tick, not N add_text calls
+    if (batch_len > 0 && objects.print_status_log) {
+        const char *existing = lv_textarea_get_text(objects.print_status_log);
+        size_t existing_len = strlen(existing);
+
+        if (existing_len + batch_len > 500) {
+            // Too long: just show the new batch (drop old)
+            lv_textarea_set_text(objects.print_status_log, batch);
+        } else {
+            char combined[600];
+            snprintf(combined, sizeof(combined), "%s%s", existing, batch);
+            lv_textarea_set_text(objects.print_status_log, combined);
+        }
+    }
+}   

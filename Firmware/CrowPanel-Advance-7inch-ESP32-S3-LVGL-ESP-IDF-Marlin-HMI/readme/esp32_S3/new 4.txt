@@ -1,0 +1,74 @@
+/**
+ * @brief Initialize RGB LCD Panel
+ *
+ * This function installs the RGB LCD panel driver, creates semaphores for synchronization,
+ * configures the RGB LCD panel with the provided parameters, registers event callbacks,
+ * resets and initializes the RGB LCD panel.
+ *
+ * @param[out] panel_handle Pointer to the handle for the initialized RGB LCD panel.
+ */
+void init_lcd(esp_lcd_panel_handle_t *panel_handle) {
+    
+    ESP_LOGI(TAG, "Install RGB LCD panel driver");
+
+    // sem_vsync_end = xSemaphoreCreateBinary();
+    // sem_gui_ready = xSemaphoreCreateBinary();
+
+    esp_lcd_rgb_panel_config_t panel_config = {
+        .data_width = 16, // RGB565 in parallel mode, thus 16bit in width
+        .psram_trans_align = 64,
+        .num_fbs = 2, // Use 2 frame buffers
+        .clk_src = LCD_CLK_SRC_DEFAULT,
+        .disp_gpio_num = PIN_NUM_DISP_EN,
+        .pclk_gpio_num = PIN_NUM_PCLK,
+        .vsync_gpio_num = PIN_NUM_VSYNC,
+        .hsync_gpio_num = PIN_NUM_HSYNC,
+        .de_gpio_num = PIN_NUM_DE,
+        .data_gpio_nums = {
+            PIN_NUM_DATA0,
+            PIN_NUM_DATA1,
+            PIN_NUM_DATA2,
+            PIN_NUM_DATA3,
+            PIN_NUM_DATA4,
+            PIN_NUM_DATA5,
+            PIN_NUM_DATA6,
+            PIN_NUM_DATA7,
+            PIN_NUM_DATA8,
+            PIN_NUM_DATA9,
+            PIN_NUM_DATA10,
+            PIN_NUM_DATA11,
+            PIN_NUM_DATA12,
+            PIN_NUM_DATA13,
+            PIN_NUM_DATA14,
+            PIN_NUM_DATA15,
+        },
+        .timings = {
+            .pclk_hz = LCD_PIXEL_CLOCK_HZ,
+            .h_res = LCD_H_RES,
+            .v_res = LCD_V_RES,
+            .hsync_back_porch = HSYNC_BACK_PORCH,
+            .hsync_front_porch = HSYNC_FRONT_PORCH,
+            .hsync_pulse_width = HSYNC_PULSE_WIDTH,
+            .vsync_back_porch = VSYNC_BACK_PORCH,
+            .vsync_front_porch = VSYNC_FRONT_PORCH,
+            .vsync_pulse_width = VSYNC_PULSE_WIDTH,
+        .flags = {
+            .pclk_idle_high = 1,
+        },
+        .flags.fb_in_psram = true, // allocate frame buffer in PSRAM
+    };
+    ESP_LOGI(TAG, "Create RGB LCD panel");
+    esp_lcd_new_rgb_panel(&panel_config, panel_handle);
+
+    ESP_LOGI(TAG, "Register event callbacks");
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = on_vsync_event,
+    };
+    esp_lcd_rgb_panel_register_event_callbacks(*panel_handle, &cbs, NULL);
+
+
+    ESP_LOGI(TAG, "Initialize RGB LCD panel");
+    esp_lcd_panel_reset(*panel_handle);
+    esp_lcd_panel_init(*panel_handle);
+}
+

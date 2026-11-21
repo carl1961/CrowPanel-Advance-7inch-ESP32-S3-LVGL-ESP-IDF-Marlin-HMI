@@ -1,0 +1,1 @@
+Stuff saved as the build went along, LOTS of reading. some rabbit chasing! LOTs of AI help

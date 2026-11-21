@@ -1,0 +1,2182 @@
+Show more
+
+
+Implemented file selection to start printing
+No changes needed in esp32_s3.c — the LVGL task already handles LIST_ADD/LIST_CLEAR. All the click-handling logic goes in main.cpp.
+
+The only additions are:
+
+A file_browser_click_cb event callback that reads the clicked list item's text and sends M23 <filename> to Marlin.
+Attaching that callback to objects.file_browser_list after ui_init().
+Here's the updated main.cpp (new code marked with // ← ADDED):
+
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "lvgl.h"
+#include "display/esp32_s3.h"
+#include "ui/ui.h"
+#include "stc8h1k28.h"
+#include "driver/uart.h"
+#include <time.h>
+#include <sys/time.h>
+
+#define MARLIN_UART_NUM     UART_NUM_1
+#define MARLIN_TX_PIN       GPIO_NUM_20
+#define MARLIN_RX_PIN       GPIO_NUM_19
+#define SERIAL_BUF_SIZE     1024
+#define MAX_GCODE_LEN       64
+#define COMMAND_QUEUE_LEN   20
+
+#define LOG_QUEUE_LEN       64
+#define LOG_LINE_MAX        512
+#define MAX_FILES           50
+#define FILE_NAME_LEN       64
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+typedef struct {
+    char line[LOG_LINE_MAX];
+} log_item_t;
+
+// ─── Globals ─────────────────────────────────────────────────────────────────
+
+extern "C" QueueHandle_t log_queue = NULL;
+
+QueueHandle_t marlin_cmd_queue = NULL;
+
+static stc8h1k28_handle_t stc8 = NULL;
+static const char *TAG = "MAIN";
+
+bool marlin_connected = false;
+bool isPrinting = false;
+uint32_t last_marlin_reply_ms = 0;
+
+// M20 file list state
+static char file_list[MAX_FILES][FILE_NAME_LEN];
+static int file_count = 0;
+static bool capturing_files = false;
+
+// ─── Forward declarations ────────────────────────────────────────────────────
+
+extern "C" void update_clock_labels_timer(lv_timer_t *timer);
+void parse_marlin_line(const char *line);
+
+// ─── Log queue ───────────────────────────────────────────────────────────────
+
+void log_queue_init(void) {
+    log_queue = xQueueCreate(LOG_QUEUE_LEN, sizeof(log_item_t));
+}
+
+void append_print_log(const char *line) {
+    if (log_queue == NULL) return;
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "%s", line);
+    xQueueSend(log_queue, &item, 0);
+}
+
+// ─── G-code send ─────────────────────────────────────────────────────────────
+
+extern "C" void send_gcode(const char *command) {
+    if (!command) return;
+    if (marlin_cmd_queue != NULL) {
+        xQueueSend(marlin_cmd_queue, command, 0);
+    }
+    if (log_queue != NULL) {
+        log_item_t item;
+        snprintf(item.line, LOG_LINE_MAX, "> %s", command);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+// ─── File browser ────────────────────────────────────────────────────────────
+
+static void update_file_browser_ui(void) {
+    if (log_queue == NULL) return;
+
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "LIST_CLEAR");
+    xQueueSend(log_queue, &item, 0);
+
+    for (int i = 0; i < file_count; i++) {
+        snprintf(item.line, LOG_LINE_MAX, "LIST_ADD:%.63s", file_list[i]);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+// ← ADDED: click handler for file list items
+static void file_browser_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_current_target(e);
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (!label) return;
+    const char *filename = lv_label_get_text(label);
+    if (!filename || strlen(filename) == 0) return;
+
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "M23 %s", filename);
+    send_gcode(cmd);
+    isPrinting = true;
+}
+
+// ─── Marlin line parser ──────────────────────────────────────────────────────
+
+void parse_marlin_line(const char *line) {
+    if (line == NULL || strlen(line) == 0) return;
+
+    // Temperature updates
+    float hcur = -1, bcur = -1, dcur = -1;
+    const char *tPos = strstr(line, "T:");
+    if (tPos) sscanf(tPos, "T:%f", &hcur);
+    const char *bPos = strstr(line, "B:");
+    if (bPos) sscanf(bPos, "B:%f", &bcur);
+    const char *cPos = strstr(line, "C:");
+    if (cPos) sscanf(cPos, "C:%f", &dcur);
+
+    char buf[16];
+    if (hcur >= 0 && objects.nozzle_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", hcur);
+        lv_label_set_text(objects.nozzle_temp_main_screen, buf);
+    }
+    if (bcur >= 0 && objects.bed_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", bcur);
+        lv_label_set_text(objects.bed_temp_main_screen, buf);
+    }
+    if (dcur >= 0 && objects.drivers_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", dcur);
+        lv_label_set_text(objects.drivers_temp_main_screen, buf);
+    }
+
+    // M20 file list parsing
+    if (strcmp(line, "Begin file list") == 0) {
+        file_count = 0;
+        capturing_files = true;
+        return;
+    }
+    if (strcmp(line, "End file list") == 0) {
+        capturing_files = false;
+        update_file_browser_ui();
+        return;
+    }
+    if (capturing_files && file_count < MAX_FILES) {
+        const char *name = line;
+
+        char *colon = strchr(line, ':');
+        if (colon && (colon - line) < 3) {
+            name = colon + 1;
+        }
+
+        char *tmp = (char *)name;
+        char *last_space = strrchr(tmp, ' ');
+        if (last_space) {
+            char *size_str = last_space + 1;
+            bool is_size = (size_str[0] != '\0');
+            for (char *p = size_str; *p; p++) {
+                if (*p < '0' || *p > '9') { is_size = false; break; }
+            }
+            if (is_size) *last_space = '\0';
+        }
+
+        snprintf(file_list[file_count], FILE_NAME_LEN, "%.63s", tmp);
+        file_count++;
+    }
+
+    // ← ADDED: detect print start / completion from Marlin
+    if (strstr(line, "Start SD print job:")) {
+        isPrinting = true;
+    }
+    if (strstr(line, "Done printing file")) {
+        isPrinting = false;
+    }
+}
+
+// ─── Tasks ───────────────────────────────────────────────────────────────────
+
+static void marlin_tx_task(void *arg) {
+    char cmd[MAX_GCODE_LEN];
+    while (1) {
+        if (xQueueReceive(marlin_cmd_queue, cmd, portMAX_DELAY)) {
+            size_t len = strlen(cmd);
+            if (cmd[len - 1] != '\n') {
+                cmd[len] = '\n';
+                len++;
+            }
+            uart_write_bytes(MARLIN_UART_NUM, cmd, len);
+            uart_wait_tx_done(MARLIN_UART_NUM, pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+static void marlin_rx_task(void *arg) {
+    uint8_t rx_buf[256];
+    static char line_accumulator[512];
+    static size_t line_pos = 0;
+
+    while (1) {
+        int len = uart_read_bytes(MARLIN_UART_NUM, rx_buf, sizeof(rx_buf) - 1, pdMS_TO_TICKS(20));
+        if (len > 0) {
+            last_marlin_reply_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            marlin_connected = true;
+
+            for (int i = 0; i < len; i++) {
+                char c = (char)rx_buf[i];
+                if (c == '\n') {
+                    line_accumulator[line_pos] = '\0';
+                    if (line_pos > 0) {
+                        parse_marlin_line(line_accumulator);
+
+                        if (strstr(line_accumulator, "T:") == NULL &&
+                            strcmp(line_accumulator, "ok") != 0 &&
+                            strncmp(line_accumulator, "ok ", 3) != 0 &&
+                            !capturing_files &&
+                            strcmp(line_accumulator, "Begin file list") != 0 &&
+                            strcmp(line_accumulator, "End file list") != 0) {
+                            append_print_log(line_accumulator);
+                        }
+                    }
+                    line_pos = 0;
+                } else if (c != '\r' && line_pos < sizeof(line_accumulator) - 1) {
+                    line_accumulator[line_pos++] = c;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void status_poller_task(void *arg) {
+    while (1) {
+        if (isPrinting) send_gcode("M27");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+static void watchdog_task(void *arg) {
+    while (1) {
+        if (marlin_connected &&
+            (xTaskGetTickCount() * portTICK_PERIOD_MS - last_marlin_reply_ms > 8000)) {
+            marlin_connected = false;
+            uart_flush(MARLIN_UART_NUM);
+            xQueueSend(marlin_cmd_queue, "M105", 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// ─── App main ────────────────────────────────────────────────────────────────
+
+extern "C" void app_main(void)
+{
+    init_display();
+    ESP_LOGI(TAG, "Start LVGL");
+
+    // RTC
+    struct tm rtc_time = {};
+    if (bm8563_get_time(rtc_handle, &rtc_time) == ESP_OK) {
+        ESP_LOGI(TAG, "RTC: %04d-%02d-%02d %02d:%02d:%02d",
+                 rtc_time.tm_year + 1900, rtc_time.tm_mon + 1, rtc_time.tm_mday,
+                 rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+        time_t t = mktime(&rtc_time);
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+    }
+
+    // Boot beep
+    stc8 = stc8h1k28_get_handle();
+    stc8h1k28_buzzer_on(stc8);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    stc8h1k28_buzzer_off(stc8);
+
+    // UART
+    uart_config_t uart_config = {};
+    uart_config.baud_rate   = 115200;
+    uart_config.data_bits   = UART_DATA_8_BITS;
+    uart_config.parity      = UART_PARITY_DISABLE;
+    uart_config.stop_bits   = UART_STOP_BITS_1;
+    uart_config.flow_ctrl   = UART_HW_FLOWCTRL_DISABLE;
+    uart_config.source_clk  = UART_SCLK_DEFAULT;
+
+    uart_param_config(MARLIN_UART_NUM, &uart_config);
+    uart_set_pin(MARLIN_UART_NUM, MARLIN_TX_PIN, MARLIN_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(MARLIN_UART_NUM, SERIAL_BUF_SIZE * 2, 0, 0, NULL, 0);
+
+    // Queues
+    log_queue_init();
+    marlin_cmd_queue = xQueueCreate(COMMAND_QUEUE_LEN, MAX_GCODE_LEN);
+
+    // UI
+    if (lvgl_port_lock(portMAX_DELAY)) {
+        ui_init();
+        if (objects.print_status_log) {
+            lv_textarea_set_text(objects.print_status_log, "");
+        }
+        // ← ADDED: attach click handler to file list
+        if (objects.file_browser_list) {
+            lv_obj_add_event_cb(objects.file_browser_list, file_browser_click_cb, LV_EVENT_CLICKED, NULL);
+        }
+        lvgl_port_unlock();
+    }
+
+    // Tasks
+    xTaskCreate(marlin_rx_task,      "rx",   4096, NULL, 5, NULL);
+    xTaskCreate(marlin_tx_task,      "tx",   3072, NULL, 3, NULL);
+    xTaskCreate(status_poller_task,  "poll", 2048, NULL, 2, NULL);
+    xTaskCreate(watchdog_task,       "wd",   2048, NULL, 1, NULL);
+
+    lv_timer_create(update_clock_labels_timer, 1000, NULL);
+
+    // Initial link
+    send_gcode("M155 S2");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    send_gcode("M20");  // ← ADDED: request file list on boot
+}
+
+esp32_s3.c — no changes needed. It's already doing the right thing with LIST_ADD/LIST_CLEAR.
+
+Summary of what was added:
+
+Location	Change
+main.cpp – new function	file_browser_click_cb — reads the tapped list item's label text and sends M23 <filename>
+main.cpp – parse_marlin_line	Detects "Start SD print job:" and "Done printing file" to set/clear isPrinting
+main.cpp – app_main	Attaches the click callback to objects.file_browser_list after ui_init()
+main.cpp – app_main	Sends M20 at boot so the file list populates immediately
+
+Tapping a filename now sends M23 gcode.g (or whatever the name is) to Marlin, which starts the print. The status_poller_task will begin sending M27 progress queries since isPrinting is set.
+
+
+Copy
+
+
+well I got a few things happening, I see the file list after doing a refresh, but they seemed grooped. maybe I have not got this done right in eez studio. no clean single file is selected .  also we need a comfirmation before printing.   since this main screen was AI generated some thing may be redundant. So I am learning as I go.
+Show more
+
+
+Reviewed LVGL 9 list layout and event handling
+The "grouped" look and lack of selection are both caused by the same issue: lv_list_add_text creates plain labels, not buttons. Labels aren't interactive, so they don't fire click events and don't get the button styling that makes items look like a proper list.
+
+Also, lv_list is deprecated in LVGL 9.6 — it's just a flex column under the hood. The fix is to create actual buttons inside the container. 
+
+EEZ Studio layout check
+Make sure your file_browser_list object in EEZ Studio has:
+
+Layout: Flex
+Flex Flow: Column (not Row, not Grid)
+Wrap: Off
+Scrollable: Yes (vertical)
+If it's set to Grid or Row, that's why items appear "grouped" in multiple columns.
+
+Updated esp32_s3.c
+Only the LIST_ADD handler changes — replace the lv_list_add_text call with button creation:
+
+// In lvgl_port_task, replace the LIST_ADD block:
+if (strncmp(item.line, "LIST_ADD:", 9) == 0) {
+    if (objects.file_browser_list) {
+        lv_obj_t *btn = lv_button_create(objects.file_browser_list);
+        lv_obj_set_width(btn, LV_PCT(100));
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, item.line + 9);
+        lv_obj_center(label);
+    }
+}
+
+That's the only change in esp32_s3.c. Everything else stays the same.
+
+Updated main.cpp
+Replace the file browser section (from // ─── File browser through the click callback) with this:
+
+// ─── File browser ────────────────────────────────────────────────────────────
+
+static char pending_filename[FILE_NAME_LEN] = {0};
+
+static void confirm_print_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    const char *text = label ? lv_label_get_text(label) : "";
+
+    if (strcmp(text, "Print") == 0) {
+        char cmd[80];
+        snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+        send_gcode(cmd);
+        isPrinting = true;
+    }
+    // Both buttons close the dialog
+    lv_obj_t *mbox = lv_obj_get_parent(btn);
+    if (mbox) lv_obj_delete(mbox);
+}
+
+static void show_print_confirmation(const char *filename) {
+    snprintf(pending_filename, sizeof(pending_filename), "%s", filename);
+
+    lv_obj_t *mbox = lv_msgbox_create(NULL);
+    lv_msgbox_add_title(mbox, "Confirm Print");
+    lv_msgbox_add_text(mbox, filename);
+    lv_msgbox_add_close_button(mbox);
+
+    lv_obj_t *btn = lv_msgbox_add_footer_button(mbox, "Print");
+    lv_obj_add_event_cb(btn, confirm_print_cb, LV_EVENT_CLICKED, NULL);
+    btn = lv_msgbox_add_footer_button(mbox, "Cancel");
+    lv_obj_add_event_cb(btn, confirm_print_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void file_browser_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_current_target(e);
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (!label) return;
+    const char *filename = lv_label_get_text(label);
+    if (!filename || strlen(filename) == 0) return;
+
+    show_print_confirmation(filename);
+}
+
+The rest of main.cpp (parser, tasks, app_main) stays exactly as I gave you last time.
+
+What changed and why
+Problem	Cause	Fix
+Files look "grouped"	lv_list_add_text creates flat labels with no button chrome; EEZ Studio container may have wrong flex flow	Create lv_button + lv_label per item; verify Flex Column in EEZ Studio
+No selection / click doesn't work	Labels don't emit LV_EVENT_CLICKED	Buttons do; event bubbles up to the list container where our callback lives
+No confirmation	Wasn't implemented	lv_msgbox modal with "Print" / "Cancel"
+
+One thing to verify in EEZ Studio
+Open the file_browser_list object's properties and confirm it's a Flex Column container. If EEZ Studio generated it as a Grid or gave it a ROW flex flow, the buttons will stack horizontally (looking "grouped"). Change it to:
+
+Layout = Flex
+Flex Flow = Column
+Flex Main Place = Start
+Flex Cross Place = Stretch 
+Then rebuild and the list should show one file per row, full-width, tappable.
+
+
+Copy
+
+
+Flex Cross Place =  only have 3 options Star End Center
+
+
+Confirmed LVGL flex alignment defaults
+That's fine — you don't need "Stretch" there. The cross place just controls alignment when items are narrower than the container. Since the code already sets lv_obj_set_width(btn, LV_PCT(100)), each button is explicitly full-width regardless of that setting.
+
+Just leave Flex Cross Place = Start (the default) and it'll work correctly.
+
+
+Copy
+
+
+inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch_gt911/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/nvs_flash/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_partition/include @"C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/toolchain/cflags" -fdiagnostics-color=always -ffunction-sections -fdata-sections -Wall -Werror=all -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=deprecated-declarations -Wextra -Wno-error=extra -Wno-unused-parameter -Wno-sign-compare -Wno-enum-conversion -gdwarf-4 -ggdb -O2 -fmacro-prefix-map=C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI=. -fmacro-prefix-map=C:/Espressif/frameworks/esp-idf-v5.5.4=/IDF -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu17 -Wno-old-style-declaration -MD -MT esp-idf/main/CMakeFiles/__idf_main.dir/display/esp32_s3.c.obj -MF esp-idf\main\CMakeFiles\__idf_main.dir\display\esp32_s3.c.obj.d -o esp-idf/main/CMakeFiles/__idf_main.dir/display/esp32_s3.c.obj -c C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c: In function 'lvgl_port_task':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:500:25: error: implicit declaration of function 'lv_button_create'; did you mean 'lv_btn_create'? [-Wimplicit-function-declaration]
+  500 |         lv_obj_t *btn = lv_button_create(objects.file_browser_list);
+      |                         ^~~~~~~~~~~~~~~~
+      |                         lv_btn_create
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:500:25: error: initialization of 'lv_obj_t *' {aka 'struct _lv_obj_t *'} from 'int' makes pointer from integer without a cast [-Wint-conversion]
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:507:11: error: expected '}' before 'else'
+  507 |         } else if (strcmp(item.line, "LIST_CLEAR") == 0) {
+      |           ^~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:494:12: warning: unused variable 'batch_len' [-Wunused-variable]
+  494 |     size_t batch_len = 0;
+      |            ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:493:10: warning: unused variable 'batch' [-Wunused-variable]
+  493 |     char batch[1024] = {0};
+      |          ^~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:507:27: error: 'item' undeclared (first use in this function)
+  507 |         } else if (strcmp(item.line, "LIST_CLEAR") == 0) {
+      |                           ^~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:507:27: note: each undeclared identifier is reported only once for each function it appears in
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:512:17: error: 'batch_len' undeclared (first use in this function)
+  512 |             if (batch_len < sizeof(batch) - 128) {
+      |                 ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:512:36: error: 'batch' undeclared (first use in this function)
+  512 |             if (batch_len < sizeof(batch) - 128) {
+      |                                    ^~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:487:14: warning: variable 'task_delay_ms' set but not used [-Wunused-but-set-variable]
+  487 |     uint32_t task_delay_ms = LVGL_PORT_TASK_MAX_DELAY_MS; // Set initial task delay
+      |              ^~~~~~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c: At top level:
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:538:9: error: expected identifier or '(' before 'if'
+  538 |         if (task_delay_ms > LVGL_PORT_TASK_MAX_DELAY_MS) {
+      |         ^~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:540:11: error: expected identifier or '(' before 'else'
+  540 |         } else if (task_delay_ms < LVGL_PORT_TASK_MIN_DELAY_MS) {
+      |           ^~~~
+In file included from C:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/include/freertos/FreeRTOS.h:66,
+                 from C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:6:
+C:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/include/freertos/projdefs.h:46:43: error: expected declaration specifiers or '...' before '(' token
+   46 |     #define pdMS_TO_TICKS( xTimeInMs )    ( ( TickType_t ) ( ( ( TickType_t ) ( xTimeInMs ) * ( TickType_t ) configTICK_RATE_HZ ) / ( TickType_t ) 1000U ) )
+      |                                           ^
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:543:20: note: in expansion of macro 'pdMS_TO_TICKS'
+  543 |         vTaskDelay(pdMS_TO_TICKS(task_delay_ms)); // Delay the task for the calculated time
+      |                    ^~~~~~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:544:5: error: expected identifier or '(' before '}' token
+  544 |     }
+      |     ^
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:545:1: error: expected identifier or '(' before '}' token
+  545 | }
+      | ^
+[1299/1309] Building CXX object esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj
+FAILED: esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj
+ccache C:\Espressif\tools\xtensa-esp-elf\esp-14.2.0_20260121\xtensa-esp-elf\bin\xtensa-esp32s3-elf-g++.exe -DESP_PLATFORM -DIDF_VER=\"v5.5.4\" -DLV_CONF_INCLUDE_SIMPLE -DSOC_MMU_PAGE_SIZE=CONFIG_MMU_PAGE_SIZE -DSOC_XTAL_FREQ_MHZ=CONFIG_XTAL_FREQ -D_GLIBCXX_HAVE_POSIX_SEMAPHORE -D_GLIBCXX_USE_POSIX_SEMAPHORE -D_GNU_SOURCE -D_POSIX_READER_WRITER_LOCKS -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/config -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/ui -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/newlib/platform_include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/config/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/config/include/freertos -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/config/xtensa/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/portable/xtensa/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/esp_additions/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/include/soc -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/include/soc/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/dma/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/ldo/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/debug_probe/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/tuning_scheme_impl/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/power_supply/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/port/esp32s3/. -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/port/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/port/esp32s3/. -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/port/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/heap/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/heap/tlsf -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/log/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3/register -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/hal/platform_port/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/hal/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/hal/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/include/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_common/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system/port/soc -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system/port/include/private -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa/deprecated_include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/include/apps -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/include/apps/sntp -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/lwip/src/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/freertos/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/esp32xx/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/esp32xx/include/arch -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/esp32xx/include/sys -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/examples -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/demos -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_timer/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/stc8h1k28/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/deprecated -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/i2c/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/touch_sensor/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/twai/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/touch_sensor/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_pm/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_ringbuf/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_gpio/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_pcnt/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_gptimer/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_spi/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_mcpwm/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_ana_cmpr/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_i2s/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdmmc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/sdmmc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdspi/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdio/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_dac/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_rmt/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_tsens/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdm/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_i2c/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_uart/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/vfs/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_ledc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_parlio/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_usb_serial_jtag/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_twai/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/bm8563/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/interface -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/rgb/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch_gt911/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/nvs_flash/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_partition/include @"C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/toolchain/cxxflags" -fdiagnostics-color=always -ffunction-sections -fdata-sections -Wall -Werror=all -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=deprecated-declarations -Wextra -Wno-error=extra -Wno-unused-parameter -Wno-sign-compare -Wno-enum-conversion -gdwarf-4 -ggdb -O2 -fmacro-prefix-map=C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI=. -fmacro-prefix-map=C:/Espressif/frameworks/esp-idf-v5.5.4=/IDF -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu++2b -fno-exceptions -fuse-cxa-atexit -MD -MT esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -MF esp-idf\main\CMakeFiles\__idf_main.dir\main.cpp.obj.d -o esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -c C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:35:26: warning: 'log_queue' initialized and declared 'extern'
+   35 | extern "C" QueueHandle_t log_queue = NULL;
+      |                          ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void confirm_print_cb(lv_event_t*)':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:101:15: error: 'lv_obj_delete' was not declared in this scope; did you mean 'lv_obj_del'?
+  101 |     if (mbox) lv_obj_delete(mbox);
+      |               ^~~~~~~~~~~~~
+      |               lv_obj_del
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void show_print_confirmation(const char*)':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:107:38: error: too few arguments to function 'lv_obj_t* lv_msgbox_create(lv_obj_t*, const char*, const char*, const char**, bool)'
+  107 |     lv_obj_t *mbox = lv_msgbox_create(NULL);
+      |                      ~~~~~~~~~~~~~~~~^~~~~~
+In file included from C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/extra/widgets/lv_widgets.h:24,
+                 from C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/extra/lv_extra.h:21,
+                 from C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/lvgl.h:69,
+                 from C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:7:
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/extra/widgets/msgbox/lv_msgbox.h:63:12: note: declared here
+   63 | lv_obj_t * lv_msgbox_create(lv_obj_t * parent, const char * title, const char * txt, const char * btn_txts[],
+      |            ^~~~~~~~~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:108:5: error: 'lv_msgbox_add_title' was not declared in this scope; did you mean 'lv_msgbox_get_title'?
+  108 |     lv_msgbox_add_title(mbox, "Confirm Print");
+      |     ^~~~~~~~~~~~~~~~~~~
+      |     lv_msgbox_get_title
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:109:5: error: 'lv_msgbox_add_text' was not declared in this scope; did you mean 'lv_msgbox_get_text'?
+  109 |     lv_msgbox_add_text(mbox, filename);
+      |     ^~~~~~~~~~~~~~~~~~
+      |     lv_msgbox_get_text
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:110:5: error: 'lv_msgbox_add_close_button' was not declared in this scope; did you mean 'lv_msgbox_get_close_btn'?
+  110 |     lv_msgbox_add_close_button(mbox);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+      |     lv_msgbox_get_close_btn
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:112:21: error: 'lv_msgbox_add_footer_button' was not declared in this scope
+  112 |     lv_obj_t *btn = lv_msgbox_add_footer_button(mbox, "Print");
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void parse_marlin_line(const char*)':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:165:9: error: 'update_file_browser_ui' was not declared in this scope
+  165 |         update_file_browser_ui();
+      |         ^~~~~~~~~~~~~~~~~~~~~~
+[1300/1309] Performing configure step for 'bootloader'
+-- Found Git: C:/Espressif/tools/idf-git/2.39.2/cmd/git.exe (found version "2.39.2.windows.1")
+-- Minimal build - OFF
+-- The C compiler identification is GNU 14.2.0
+-- The CXX compiler identification is GNU 14.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Building ESP-IDF components for target esp32s3
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5 SoCs
+-- Project sdkconfig file C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/sdkconfig
+-- Compiler supported targets: xtensa-esp-elf
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3/ld/esp32s3.peripherals.ld
+-- Bootloader project name: "bootloader" version: 1
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.api.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.bt_funcs.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.libgcc.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.wdt.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.version.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.newlib.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader/subproject/main/ld/esp32s3/bootloader.rom.ld
+-- Components: bootloader bootloader_support efuse esp_app_format esp_bootloader_format esp_common esp_hw_support esp_rom esp_security esp_system esptool_py freertos hal log main micro-ecc newlib partition_table soc spi_flash xtensa
+-- Component paths: C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader_support C:/Espressif/frameworks/esp-idf-v5.5.4/components/efuse C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_app_format C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_bootloader_format C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_common C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_security C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system C:/Espressif/frameworks/esp-idf-v5.5.4/components/esptool_py C:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos C:/Espressif/frameworks/esp-idf-v5.5.4/components/hal C:/Espressif/frameworks/esp-idf-v5.5.4/components/log C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader/subproject/main C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader/subproject/components/micro-ecc C:/Espressif/frameworks/esp-idf-v5.5.4/components/newlib C:/Espressif/frameworks/esp-idf-v5.5.4/components/partition_table C:/Espressif/frameworks/esp-idf-v5.5.4/components/soc C:/Espressif/frameworks/esp-idf-v5.5.4/components/spi_flash C:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader/subproject/main/ld/esp32s3/bootloader.ld
+-- Configuring done (7.3s)
+-- Generating done (0.1s)
+-- Build files have been written to: C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/bootloader
+ninja: build stopped: subcommand failed.
+ninja failed with exit code 1, output of the command is in the C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stderr_output_20068 and C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stdout_output_20068
+Show more
+
+
+Analyzed LVGL 8 compilation errors
+Your LVGL is v8.x — I was using v9 APIs. Here are the fixes:
+
+esp32_s3.c — fix the LIST_ADD block (around line 498–505)
+if (strncmp(item.line, "LIST_ADD:", 9) == 0) {
+    if (objects.file_browser_list) {
+        lv_obj_t *btn = lv_btn_create(objects.file_browser_list);
+        lv_obj_set_width(btn, LV_PCT(100));
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, item.line + 9);
+        lv_obj_center(label);
+    }
+}
+
+Two fixes: lv_button_create → lv_btn_create, and make sure the closing } for the if (strncmp(...)) block is present before the else if (your error showed a missing brace).
+
+main.cpp — replace the confirmation dialog code
+Replace confirm_print_cb and show_print_confirmation with this (LVGL 8 msgbox API):
+
+static char pending_filename[FILE_NAME_LEN] = {0};
+
+static void confirm_print_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    const char *text = lv_btn_get_text(btn);
+
+    if (text && strcmp(text, "Print") == 0) {
+        char cmd[80];
+        snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+        send_gcode(cmd);
+        isPrinting = true;
+    }
+    // Walk up: btn → btns container → msgbox
+    lv_obj_t *btns = lv_obj_get_parent(btn);
+    lv_obj_t *mbox = lv_obj_get_parent(btns);
+    if (mbox) lv_obj_del(mbox);
+}
+
+static void show_print_confirmation(const char *filename) {
+    snprintf(pending_filename, sizeof(pending_filename), "%s", filename);
+
+    const char *btn_labels[] = {"Print", "Cancel", NULL};
+    lv_obj_t *mbox = lv_msgbox_create(NULL, "Confirm Print", filename, btn_labels, false);
+    lv_obj_add_event_cb(mbox, confirm_print_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+Key differences for LVGL 8:
+
+LVGL 9 (what I gave)	LVGL 8 (correct)
+lv_obj_delete(mbox)	lv_obj_del(mbox)
+lv_msgbox_create(NULL) + separate add_title/add_text/add_footer_button	lv_msgbox_create(parent, title, txt, btn_labels[], auto_del) — all in one call
+LV_EVENT_CLICKED on individual buttons	LV_EVENT_VALUE_CHANGED on the msgbox itself
+
+Also: add a forward declaration
+At the top of main.cpp (with your other forward declarations), add:
+
+static void update_file_browser_ui(void);
+
+That fixes the "not declared in this scope" error (likely a paste-order issue in your file).
+
+Summary of all fixes:
+
+lv_button_create → lv_btn_create (esp32_s3.c)
+Missing } before else if (esp32_s3.c) — make sure the if (strncmp(...)) block is fully closed
+lv_obj_delete → lv_obj_del (main.cpp)
+Rewrite msgbox creation for LVGL 8 one-shot API (main.cpp)
+Forward-declare update_file_browser_ui (main.cpp)
+
+Copy
+
+
+orks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/portable/xtensa/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/freertos/esp_additions/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/include/soc -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/include/soc/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/dma/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/ldo/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/debug_probe/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/tuning_scheme_impl/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/power_supply/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/port/esp32s3/. -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/port/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/port/esp32s3/. -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/mspi_timing_tuning/port/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/heap/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/heap/tlsf -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/log/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/soc/esp32s3/register -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/hal/platform_port/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/hal/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/hal/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3/include/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_rom/esp32s3 -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_common/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system/port/soc -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_system/port/include/private -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/xtensa/deprecated_include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/include/apps -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/include/apps/sntp -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/lwip/src/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/freertos/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/esp32xx/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/esp32xx/include/arch -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/lwip/port/esp32xx/include/sys -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/examples -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/demos -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_timer/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/stc8h1k28/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/deprecated -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/i2c/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/touch_sensor/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/twai/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/driver/touch_sensor/esp32s3/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_pm/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_ringbuf/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_gpio/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_pcnt/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_gptimer/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_spi/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_mcpwm/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_ana_cmpr/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_i2s/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdmmc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/sdmmc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdspi/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdio/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_dac/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_rmt/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_tsens/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_sdm/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_i2c/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_uart/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/vfs/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_ledc/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_parlio/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_usb_serial_jtag/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_driver_twai/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/bm8563/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/interface -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/rgb/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch_gt911/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/nvs_flash/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_partition/include @"C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/toolchain/cxxflags" -fdiagnostics-color=always -ffunction-sections -fdata-sections -Wall -Werror=all -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=deprecated-declarations -Wextra -Wno-error=extra -Wno-unused-parameter -Wno-sign-compare -Wno-enum-conversion -gdwarf-4 -ggdb -O2 -fmacro-prefix-map=C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI=. -fmacro-prefix-map=C:/Espressif/frameworks/esp-idf-v5.5.4=/IDF -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu++2b -fno-exceptions -fuse-cxa-atexit -MD -MT esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -MF esp-idf\main\CMakeFiles\__idf_main.dir\main.cpp.obj.d -o esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -c C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:27:1: error: 's' does not name a type
+   27 | s
+      | ^
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:39:26: warning: 'log_queue' initialized and declared 'extern'
+   39 | extern "C" QueueHandle_t log_queue = NULL;
+      |                          ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void confirm_print_cb(lv_event_t*)':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:94:24: error: 'lv_btn_get_text' was not declared in this scope; did you mean 'lv_span_set_text'?
+   94 |     const char *text = lv_btn_get_text(btn);
+      |                        ^~~~~~~~~~~~~~~
+      |                        lv_span_set_text
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void parse_marlin_line(const char*)':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:163:9: error: 'update_file_browser_ui' was not declared in this scope
+  163 |         update_file_browser_ui();
+      |         ^~~~~~~~~~~~~~~~~~~~~~
+[122/123] Generating binary image from built executable
+esptool.py v4.12.0
+Creating esp32s3 image...
+Merged 2 ELF sections
+Successfully created esp32s3 image.
+Generated C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/bootloader/bootloader.bin
+[123/123] C:\WINDOWS\system32\cmd.exe /C "cd /D C:\Users\c...3-LVGL-ESP-IDF-Marlin-HMI/build/bootloader/bootloader.bin"
+Bootloader binary size 0x5700 bytes. 0x2900 bytes (32%) free.
+ninja: build stopped: subcommand failed.
+ninja failed with exit code 1, output of the command is in the C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stderr_output_25208 and C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stdout_output_25208
+C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI>
+Show more
+
+
+Analyzed LVGL 8 compilation errors and callback fix
+Three issues:
+
+1. Stray s on line 27
+A paste artifact — delete that lone s character on line 27.
+
+2. lv_btn_get_text doesn't exist in LVGL 8
+In LVGL 8, msgbox buttons are part of a lv_btnmatrix, not individual lv_btn objects. The event gives you the button index via lv_event_get_int(e). Replace confirm_print_cb with:
+
+static void confirm_print_cb(lv_event_t *e) {
+    int btn_idx = lv_event_get_int(e);  // 0 = "Print", 1 = "Cancel"
+
+    if (btn_idx == 0) {
+        char cmd[80];
+        snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+        send_gcode(cmd);
+        isPrinting = true;
+    }
+
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    if (mbox) lv_obj_del(mbox);
+}
+
+3. update_file_browser_ui not declared before use
+Make sure this forward declaration appears above parse_marlin_line (e.g., right after your other forward declarations near the top):
+
+static void update_file_browser_ui(void);
+
+If parse_marlin_line is defined before update_file_browser_ui in the file, the compiler doesn't know about it yet. The forward declaration fixes that.
+
+TL;DR — three edits to main.cpp:
+
+Line	Fix
+27	Delete stray s
+~90–100	Replace confirm_print_cb body with the lv_event_get_int(e) version above
+Near top (after other forward decls)	Add static void update_file_browser_ui(void);
+
+
+Copy
+
+
+ok EEZ Studio is using LVGL 8.4  and We building with ESP-IDF 5.5.4                           are -Wno-enum-conversion -gdwarf-4 -ggdb -O2 -fmacro-prefix-map=C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI=. -fmacro-prefix-map=C:/Espressif/frameworks/esp-idf-v5.5.4=/IDF -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu++2b -fno-exceptions -fuse-cxa-atexit -MD -MT esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -MF esp-idf\main\CMakeFiles\__idf_main.dir\main.cpp.obj.d -o esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -c C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:38:26: warning: 'log_queue' initialized and declared 'extern'
+   38 | extern "C" QueueHandle_t log_queue = NULL;
+      |                          ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void confirm_print_cb(lv_event_t*)':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:92:19: error: 'lv_event_get_int' was not declared in this scope; did you mean 'lv_event_get_key'?
+   92 |     int btn_idx = lv_event_get_int(e);  // 0 = "Print", 1 = "Cancel"
+      |                   ^~~~~~~~~~~~~~~~
+      |                   lv_event_get_key
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: At global scope:
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:27:13: warning: 'void update_file_browser_ui()' declared 'static' but never defined [-Wunused-function]
+   27 | static void update_file_browser_ui(void);
+      |             ^~~~~~~~~~~~~~~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:27:13: warning: 'void update_file_browser_ui()' used but never defined
+ninja: build stopped: subcommand failed.
+ninja failed with exit code 1, output of the command is in the C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stderr_output_25496 and C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stdout_output_25496
+C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI>
+Show more
+
+
+Verifying LVGL 8.4 msgbox API
+Two issues:
+
+1. lv_event_get_int doesn't exist in LVGL 8
+That's an LVGL 9 API. In LVGL 8.4 you use lv_msgbox_get_active_btn() on the msgbox object. Replace confirm_print_cb with:
+
+static void confirm_print_cb(lv_event_t *e) {
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    uint16_t btn_idx = lv_msgbox_get_active_btn(mbox);
+
+    if (btn_idx == 0) {  // "Print"
+        char cmd[80];
+        snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+        send_gcode(cmd);
+        isPrinting = true;
+    }
+    if (mbox) lv_obj_del(mbox);
+}
+
+And show_print_confirmation stays as:
+
+static void show_print_confirmation(const char *filename) {
+    snprintf(pending_filename, sizeof(pending_filename), "%s", filename);
+    const char *btn_labels[] = {"Print", "Cancel", NULL};
+    lv_obj_t *mbox = lv_msgbox_create(NULL, "Confirm Print", filename, btn_labels, false);
+    lv_obj_add_event_cb(mbox, confirm_print_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+2. update_file_browser_ui "declared but never defined"
+The compiler is telling you the function body is missing from your file. You have the forward declaration on line 27, but the actual static void update_file_browser_ui(void) { ... } with its body (the LIST_CLEAR / LIST_ADD loop) is not in the file. 
+
+Make sure this function is present somewhere in main.cpp (after the globals, before parse_marlin_line is fine):
+
+static void update_file_browser_ui(void) {
+    if (log_queue == NULL) return;
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "LIST_CLEAR");
+    xQueueSend(log_queue, &item, 0);
+    for (int i = 0; i < file_count; i++) {
+        snprintf(item.line, LOG_LINE_MAX, "LIST_ADD:%.63s", file_list[i]);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+TL;DR:
+
+Error	Fix
+lv_event_get_int not declared	Use lv_msgbox_get_active_btn(mbox) instead
+update_file_browser_ui declared but never defined	The function body is missing from your file — add it back
+
+
+Copy
+
+
+z-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/interface -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_lcd/rgb/include -IC:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/esp_lcd_touch_gt911/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/nvs_flash/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_partition/include @"C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/toolchain/cflags" -fdiagnostics-color=always -ffunction-sections -fdata-sections -Wall -Werror=all -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=deprecated-declarations -Wextra -Wno-error=extra -Wno-unused-parameter -Wno-sign-compare -Wno-enum-conversion -gdwarf-4 -ggdb -O2 -fmacro-prefix-map=C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI=. -fmacro-prefix-map=C:/Espressif/frameworks/esp-idf-v5.5.4=/IDF -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu17 -Wno-old-style-declaration -MD -MT esp-idf/main/CMakeFiles/__idf_main.dir/display/esp32_s3.c.obj -MF esp-idf\main\CMakeFiles\__idf_main.dir\display\esp32_s3.c.obj.d -o esp-idf/main/CMakeFiles/__idf_main.dir/display/esp32_s3.c.obj -c C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c: In function 'lvgl_port_task':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:508:11: error: expected '}' before 'else'
+  508 |         } else { if (strcmp(item.line, "LIST_CLEAR") == 0) {
+      |           ^~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:494:12: warning: unused variable 'batch_len' [-Wunused-variable]
+  494 |     size_t batch_len = 0;
+      |            ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:493:10: warning: unused variable 'batch' [-Wunused-variable]
+  493 |     char batch[1024] = {0};
+      |          ^~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:508:29: error: 'item' undeclared (first use in this function)
+  508 |         } else { if (strcmp(item.line, "LIST_CLEAR") == 0) {
+      |                             ^~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:508:29: note: each undeclared identifier is reported only once for each function it appears in
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:513:17: error: 'batch_len' undeclared (first use in this function)
+  513 |             if (batch_len < sizeof(batch) - 128) {
+      |                 ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:513:36: error: 'batch' undeclared (first use in this function)
+  513 |             if (batch_len < sizeof(batch) - 128) {
+      |                                    ^~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c: At top level:
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:546:1: error: expected identifier or '(' before '}' token
+  546 | }
+      | ^
+[1299/1309] Building CXX object esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:38:26: warning: 'log_queue' initialized and declared 'extern'
+   38 | extern "C" QueueHandle_t log_queue = NULL;
+      |                          ^~~~~~~~~
+[1300/1309] Performing configure step for 'bootloader'
+-- Found Git: C:/Espressif/tools/idf-git/2.39.2/cmd/git.exe (found version "2.39.2.windows.1")
+-- Minimal build - OFF
+-- The C compiler identification is GNU 14.2.0
+-- The CXX compiler identification is GNU 14.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Building ESP-IDF components for target esp32s3
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5 SoCs
+Show more
+
+
+Identified malformed if/else chain in esp32_s3.c
+The problem is on line 508: you have } else { if (...) instead of } else if (...). That extra { breaks the if/else chain.
+
+Replace the entire queue-draining block inside lvgl_port_task (from the while (xQueueReceive... line through the closing } of the else) with this:
+
+while (xQueueReceive(log_queue, &item, 0) == pdTRUE) {
+    if (strncmp(item.line, "LIST_ADD:", 9) == 0) {
+        if (objects.file_browser_list) {
+            lv_obj_t *btn = lv_btn_create(objects.file_browser_list);
+            lv_obj_set_width(btn, LV_PCT(100));
+            lv_obj_t *label = lv_label_create(btn);
+            lv_label_set_text(label, item.line + 9);
+            lv_obj_center(label);
+        }
+    } else if (strcmp(item.line, "LIST_CLEAR") == 0) {
+        if (objects.file_browser_list) {
+            lv_obj_clean(objects.file_browser_list);
+        }
+    } else {
+        if (batch_len < sizeof(batch) - 128) {
+            batch_len += snprintf(batch + batch_len, sizeof(batch) - batch_len, "%s\n", item.line);
+        }
+    }
+}
+
+The key fix: } else if (strcmp(...)) — no extra { between else and if.
+
+
+Copy
+
+
+now we can select the files but nothing happen when i click then.
+
+
+Verifying LV_BUBBLE_CLICKED availability in LVGL 8.4
+The click events on the buttons aren't reaching the parent container. In LVGL 8, you must explicitly enable event bubbling on each child button with LV_OBJ_FLAG_EVENT_BUBBLE. 
+
+Fix in esp32_s3.c — add one line after creating each button
+if (strncmp(item.line, "LIST_ADD:", 9) == 0) {
+    if (objects.file_browser_list) {
+        lv_obj_t *btn = lv_btn_create(objects.file_browser_list);
+        lv_obj_set_width(btn, LV_PCT(100));
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);  // ← THIS LINE
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, item.line + 9);
+        lv_obj_center(label);
+    }
+}
+
+Fix in main.cpp — use lv_event_get_target not lv_event_get_current_target
+When an event bubbles up, lv_event_get_target(e) gives you the original button that was clicked, while lv_event_get_current_target(e) gives you the container (where the callback is attached). You need the button to read its label:
+
+static void file_browser_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);  // the actual button clicked
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (!label) return;
+    const char *filename = lv_label_get_text(label);
+    if (!filename || strlen(filename) == 0) return;
+
+    show_print_confirmation(filename);
+}
+
+That's it — the LV_OBJ_FLAG_EVENT_BUBBLE flag is what makes the parent's LV_EVENT_CLICKED callback fire when a child button is tapped. 
+
+
+Copy
+
+
+we might need debug help. pressing file name pops up white screen then is goes back to main screen likr a reboot                                       I (1165) MAIN: Start LVGL
+I (1171) MAIN: RTC: 2026-11-16 11:02:05
+I (2023) main_task: Returned from app_main()
+Guru Meditation Error: Core  1 panic'ed (LoadProhibited). Exception was unhandled.
+
+Core  1 register dump:
+PC      : 0x42034e30  PS      : 0x00060730  A0      : 0x82035290  A1      : 0x3fced0f0
+--- 0x42034e30: allocate_btn_areas_and_controls at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:862(inlined by) lv_btnmatrix_set_map at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:101
+A2      : 0x3fca26d0  A3      : 0x3fced290  A4      : 0x00000049  A5      : 0x3fca25d4
+A6      : 0x3fca25d4  A7      : 0x00000000  A8      : 0x00000000  A9      : 0x00000016
+A10     : 0x3c15dd44  A11     : 0x00000000  A12     : 0x00000000  A13     : 0x3fced290
+A14     : 0x3fca26d0  A15     : 0x00000000  SAR     : 0x00000020  EXCCAUSE: 0x0000001c
+EXCVADDR: 0x00000016  LBEG    : 0x42032214  LEND    : 0x4203223e  LCOUNT  : 0x00000000
+--- 0x42032214: lv_style_get_prop_inlined at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.h:474(inlined by) lv_style_get_prop at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.c:295
+--- 0x4203223e: lv_style_get_prop_inlined at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.h:464(inlined by) lv_style_get_prop at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.c:295
+
+
+Backtrace: 0x42034e2d:0x3fced0f0 0x4203528d:0x3fced170 0x4205f6b1:0x3fced1a0 0x4201b001:0x3fced1c0 0x4201b0d7:0x3fced1e0 0x4201facb:0x3fced220 0x4201fb6d:0x3fced290 0x4201fb59:0x3fced2b0 0x4201fb59:0x3fced2d0 0x4201fb59:0x3fced2f0 0x42020144:0x3fced310 0x42023b67:0x3fced330 0x4203272b:0x3fced3b0 0x4201a258:0x3fced3e0
+--- 0x42034e2d: allocate_btn_areas_and_controls at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:869(inlined by) lv_btnmatrix_set_map at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:101
+--- 0x4203528d: lv_btnmatrix_set_map at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:96(inlined by) lv_btnmatrix_event at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:430
+--- 0x4205f6b1: lv_obj_event_base at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_event.c:96
+--- 0x4201b001: event_send_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_event.c:452
+--- 0x4201b0d7: lv_event_send at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_event.c:74
+--- 0x4201facb: lv_obj_refr_size at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:195
+--- 0x4201fb6d: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1135
+--- 0x4201fb59: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1130
+--- 0x4201fb59: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1130
+--- 0x4201fb59: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1130
+--- 0x42020144: lv_obj_update_layout at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:316(inlined by) lv_obj_update_layout at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:301
+--- 0x42023b67: _lv_disp_refr_timer at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_refr.c:311
+--- 0x4203272b: lv_timer_exec at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_timer.c:313(inlined by) lv_timer_handler at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_timer.c:109
+--- 0x4201a258: lvgl_port_task at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:490
+
+
+
+
+ELF file SHA256: 10847da8a
+
+Rebooting...
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4037c4c2
+--- 0x4037c4c2: esp_cpu_wait_for_intr at C:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_hw_support/cpu.c:64
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x10 (RTCWDT_RTC_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2820,len:0x1668
+load:0x403c8700,len:0xec0
+--- 0x403c8700: _stext at ??:?
+load:0x403cb700,len:0x317c
+entry 0x403c894c
+--- 0x403c894c: call_start_cpu0 at C:/Espressif/frameworks/esp-idf-v5.5.4/components/bootloader/subproject/main/bootloader_start.c:27
+I (25) boot: ESP-IDF v5.5.4 2nd stage bootloader
+I (25) boot: compile time Nov 15 2026 23:02:52
+I (25) boot: Multicore bootloader
+I (26) boot: chip revision: v0.2
+I (28) boot: efuse block revision: v1.4
+I (32) qio_mode: Enabling default flash chip QIO
+I (36) boot.esp32s3: Boot SPI Speed : 80MHz
+I (40) boot.esp32s3: SPI Mode       : QIO
+I (44) boot.esp32s3: SPI Flash Size : 16MB
+I (48) boot: Enabling RNG early entropy source...
+I (52) boot: Partition Table:
+I (55) boot: ## Label            Usage          Type ST Offset   Length
+I (61) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (68) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (74) boot:  2 factory          factory app      00 00 00010000 00400000
+I (81) boot:  3 storage          Unknown data     01 81 00410000 00b00000
+I (87) boot: End of partition table
+I (91) esp_image: segment 0: paddr=00010020 vaddr=3c070020 size=135950h (1268048) map
+I (286) esp_image: segment 1: paddr=00145978 vaddr=3fc98b00 size=0380ch ( 14348) load
+I (289) esp_image: segment 2: paddr=0014918c vaddr=40374000 size=06e8ch ( 28300) load
+I (295) esp_image: segment 3: paddr=00150020 vaddr=42000020 size=6677ch (419708) map
+I (360) esp_image: segment 4: paddr=001b67a4 vaddr=4037ae8c size=0db80h ( 56192) load
+I (371) esp_image: segment 5: paddr=001c432c vaddr=50000000 size=00020h (    32) load
+I (379) boot: Loaded app from partition at offset 0x10000
+I (379) boot: Disabling RNG early entropy source...
+I (389) octal_psram: vendor id    : 0x0d (AP)
+I (389) octal_psram: dev id       : 0x02 (generation 3)
+I (390) octal_psram: density      : 0x03 (64 Mbit)
+I (392) octal_psram: good-die     : 0x01 (Pass)
+I (396) octal_psram: Latency      : 0x01 (Fixed)
+I (400) octal_psram: VCC          : 0x01 (3V)
+I (404) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (409) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (414) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (419) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (424) octal_psram: DriveStrength: 0x00 (1/1)
+I (428) MSPI Timing: Enter psram timing tuning
+I (433) esp_psram: Found 8MB PSRAM device
+I (436) esp_psram: Speed: 80MHz
+I (533) mmu_psram: Read only data copied and mapped to SPIRAM
+I (569) mmu_psram: Instructions copied and mapped to SPIRAM
+I (569) cpu_start: Multicore app
+I (895) esp_psram: SPI SRAM memory test OK
+I (903) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+I (904) cpu_start: Pro cpu start user code
+I (904) cpu_start: cpu freq: 240000000 Hz
+I (906) app_init: Application information:
+I (910) app_init: Project name:     CrowPanel-Advance-7inch-ESP32-S
+I (916) app_init: App version:      1
+I (919) app_init: Compile time:     Nov 15 2026 22:59:32
+I (924) app_init: ELF file SHA256:  10847da8a...
+I (928) app_init: ESP-IDF:          v5.5.4
+I (932) efuse_init: Min chip rev:     v0.0
+I (936) efuse_init: Max chip rev:     v0.99
+I (940) efuse_init: Chip rev:         v0.2
+I (944) heap_init: Initializing. RAM available for dynamic allocation:
+I (950) heap_init: At 3FC9EEF0 len 0004A820 (298 KiB): RAM
+I (955) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (960) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (966) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+I (971) esp_psram: Adding pool of 6464K of PSRAM memory to heap allocator
+I (977) esp_psram: Adding pool of 41K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (989) spi_flash: detected chip: generic
+I (992) spi_flash: flash io: qio
+I (995) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (1001) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (1008) main_task: Started on CPU0
+I (1021) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (1021) main_task: Calling app_main()
+I (1023) DISPLAY: I2C Bus successfully initialized!
+I (1027) STC8H1K28: stc8h1k28 initialized successfully
+I (1032) DISPLAY: stc8h1k28 successfully initialized
+I (1036) DISPLAY: Install Touch driver
+I (1040) DISPLAY: Create LCD panel IO handle
+I (1044) DISPLAY: Create a new GT911 touch driver
+I (1048) GT911: Start touch_gt911_read_cfg
+I (1053) GT911: TouchPad_ID:0x39,0x31,0x31
+I (1056) GT911: TouchPad_Config_Version:255
+I (1060) GT911: TouchPad X 1:3
+I (1063) GT911: TouchPad X 0:32
+I (1066) GT911: TouchPad X resolution:800
+I (1069) GT911: TouchPad Y resolution:480
+I (1073) BM8563: BM8563 initialized successfully
+I (1077) DISPLAY: bm8563 successfully initialized
+I (1082) DISPLAY: Install RGB LCD panel driver
+I (1086) DISPLAY: Create RGB LCD panel
+I (1134) DISPLAY: Register event callbacks
+I (1134) DISPLAY: Initialize RGB LCD panel
+I (1134) DISPLAY: RGB LCD panel driver completely initialized.
+I (1136) DISPLAY: Initialize LVGL library
+I (1140) DISPLAY: Use frame buffers as LVGL draw buffers
+I (1145) DISPLAY: Register display driver to LVGL
+I (1151) DISPLAY: Register input device driver to LVGL
+I (1154) DISPLAY: Start lv_timer_handler task
+I (1158) DISPLAY: Starting LVGL task
+I (1159) MAIN: Start LVGL
+I (1165) MAIN: RTC: 2026-11-16 11:05:35
+I (2017) main_task: Returned from app_main()
+Show more
+
+
+Error
+Something went wrong
+
+Try again
+
+Copy
+
+
+Guru Meditation Error: Core  1 panic'ed (LoadProhibited). Exception was unhandled.
+
+Core  1 register dump:
+PC      : 0x42034e30  PS      : 0x00060730  A0      : 0x82035290  A1      : 0x3fced0f0
+--- 0x42034e30: allocate_btn_areas_and_controls at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:862(inlined by) lv_btnmatrix_set_map at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:101
+A2      : 0x3fca26d0  A3      : 0x3fced290  A4      : 0x00000049  A5      : 0x3fca25d4
+A6      : 0x3fca25d4  A7      : 0x00000000  A8      : 0x00000000  A9      : 0x00000016
+A10     : 0x3c15dd44  A11     : 0x00000000  A12     : 0x00000000  A13     : 0x3fced290
+A14     : 0x3fca26d0  A15     : 0x00000000  SAR     : 0x00000020  EXCCAUSE: 0x0000001c
+EXCVADDR: 0x00000016  LBEG    : 0x42032214  LEND    : 0x4203223e  LCOUNT  : 0x00000000
+--- 0x42032214: lv_style_get_prop_inlined at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.h:474(inlined by) lv_style_get_prop at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.c:295
+--- 0x4203223e: lv_style_get_prop_inlined at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.h:464(inlined by) lv_style_get_prop at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_style.c:295
+
+
+Backtrace: 0x42034e2d:0x3fced0f0 0x4203528d:0x3fced170 0x4205f6b1:0x3fced1a0 0x4201b001:0x3fced1c0 0x4201b0d7:0x3fced1e0 0x4201facb:0x3fced220 0x4201fb6d:0x3fced290 0x4201fb59:0x3fced2b0 0x4201fb59:0x3fced2d0 0x4201fb59:0x3fced2f0 0x42020144:0x3fced310 0x42023b67:0x3fced330 0x4203272b:0x3fced3b0 0x4201a258:0x3fced3e0
+--- 0x42034e2d: allocate_btn_areas_and_controls at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:869(inlined by) lv_btnmatrix_set_map at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:101
+--- 0x4203528d: lv_btnmatrix_set_map at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:96(inlined by) lv_btnmatrix_event at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/widgets/lv_btnmatrix.c:430
+--- 0x4205f6b1: lv_obj_event_base at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_event.c:96
+--- 0x4201b001: event_send_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_event.c:452
+--- 0x4201b0d7: lv_event_send at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_event.c:74
+--- 0x4201facb: lv_obj_refr_size at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:195
+--- 0x4201fb6d: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1135
+--- 0x4201fb59: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1130
+--- 0x4201fb59: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1130
+--- 0x4201fb59: layout_update_core at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:1130
+--- 0x42020144: lv_obj_update_layout at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:316(inlined by) lv_obj_update_layout at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_obj_pos.c:301
+--- 0x42023b67: _lv_disp_refr_timer at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/core/lv_refr.c:311
+--- 0x4203272b: lv_timer_exec at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_timer.c:313(inlined by) lv_timer_handler at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/components/lvgl/src/misc/lv_timer.c:109
+--- 0x4201a258: lvgl_port_task at C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/display/esp32_s3.c:490
+
+
+
+
+ELF file SHA256: 10847da8a
+
+Rebooting...
+Show more
+
+
+Identified dangling pointer in btn_labels array
+The crash is a use-after-scope bug. In LVGL 8, lv_msgbox_create stores a pointer to your btn_labels array — it does NOT copy it. Your array is a local variable that dies when show_print_confirmation returns, so when LVGL later lays out the btnmatrix, it reads freed stack memory → null deref → crash.
+
+Fix in main.cpp
+Make the button labels static so they live for the entire program:
+
+static void show_print_confirmation(const char *filename) {
+    snprintf(pending_filename, sizeof(pending_filename), "%s", filename);
+
+    static const char *btn_labels[] = {"Print", "Cancel", NULL};  // ← static
+    lv_obj_t *mbox = lv_msgbox_create(NULL, "Confirm Print", filename, btn_labels, false);
+    lv_obj_add_event_cb(mbox, confirm_print_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+The only change: const char *btn_labels[] → static const char *btn_labels[].
+
+That's it. The static keyword puts the array in the data segment instead of the stack, so the pointer remains valid for the lifetime of the msgbox.
+
+
+Copy
+
+
+Worked, but I have on button on my main screen, the Set Time that gets triggered evert time I press void space, when I clicked cance on the popup to cancel the file, this set time screen poped up. so seems to me my time setting screen is not setup correctly on main screen.
+Show more
+
+
+Analyzed LVGL 8 msgbox touch propagation issue
+This is a classic LVGL 8 issue: when the msgbox is deleted during a touch event, the touch release propagates through to whatever button is underneath (your "Set Time" button). The fix is to add a full-screen blocking overlay behind the msgbox so no clicks reach the main screen while the dialog is open.
+
+Fix in main.cpp
+Replace show_print_confirmation and confirm_print_cb with this:
+
+static lv_obj_t *modal_overlay = NULL;
+
+static void confirm_print_cb(lv_event_t *e) {
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    uint16_t btn_idx = lv_msgbox_get_active_btn(mbox);
+
+    if (btn_idx == 0) {  // "Print"
+        char cmd[80];
+        snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+        send_gcode(cmd);
+        isPrinting = true;
+    }
+
+    if (mbox) lv_obj_del(mbox);
+    if (modal_overlay) {
+        lv_obj_del(modal_overlay);
+        modal_overlay = NULL;
+    }
+}
+
+static void show_print_confirmation(const char *filename) {
+    snprintf(pending_filename, sizeof(pending_filename), "%s", filename);
+
+    // Full-screen overlay to block clicks to the main screen
+    lv_obj_t *scr = lv_obj_get_screen(NULL);
+    modal_overlay = lv_obj_create(scr);
+    lv_obj_set_size(modal_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(modal_overlay, 0, 0);
+    lv_obj_set_style_bg_opa(modal_overlay, LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(modal_overlay, lv_color_black(), 0);
+    lv_obj_add_flag(modal_overlay, LV_OBJ_FLAG_CLICKABLE);  // absorbs all touches
+
+    static const char *btn_labels[] = {"Print", "Cancel", NULL};
+    lv_obj_t *mbox = lv_msgbox_create(modal_overlay, "Confirm Print", filename, btn_labels, false);
+    lv_obj_center(mbox);
+    lv_obj_add_event_cb(mbox, confirm_print_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+What changed:
+
+Before	After	Why
+lv_msgbox_create(NULL, ...)	lv_msgbox_create(modal_overlay, ...)	Msgbox is now a child of the overlay, not the screen
+No overlay	Full-screen clickable overlay behind msgbox	Absorbs all touch events so nothing on the main screen gets clicked
+Delete only mbox	Delete both mbox and overlay	Cleans up both when dialog closes
+
+The overlay's LV_OBJ_FLAG_CLICKABLE flag is the key — it makes the overlay "eat" all touches, so your "Set Time" button (or any other button) underneath can never receive a click while the dialog is open.
+
+
+Copy
+
+
+lude -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/nvs_flash/include -IC:/Espressif/frameworks/esp-idf-v5.5.4/components/esp_partition/include @"C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/build/toolchain/cxxflags" -fdiagnostics-color=always -ffunction-sections -fdata-sections -Wall -Werror=all -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=deprecated-declarations -Wextra -Wno-error=extra -Wno-unused-parameter -Wno-sign-compare -Wno-enum-conversion -gdwarf-4 -ggdb -O2 -fmacro-prefix-map=C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI=. -fmacro-prefix-map=C:/Espressif/frameworks/esp-idf-v5.5.4=/IDF -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu++2b -fno-exceptions -fuse-cxa-atexit -MD -MT esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -MF esp-idf\main\CMakeFiles\__idf_main.dir\main.cpp.obj.d -o esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj -c C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:38:26: warning: 'log_queue' initialized and declared 'extern'
+   38 | extern "C" QueueHandle_t log_queue = NULL;
+      |                          ^~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: In function 'void app_main()':
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:333:60: error: 'file_browser_click_cb' was not declared in this scope
+  333 |             lv_obj_add_event_cb(objects.file_browser_list, file_browser_click_cb, LV_EVENT_CLICKED, NULL);
+      |                                                            ^~~~~~~~~~~~~~~~~~~~~
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp: At global scope:
+C:/Users/cmshe/eez-projects/CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI/main/main.cpp:123:13: warning: 'void show_print_confirmation(const char*)' defined but not used [-Wunused-function]
+  123 | static void show_print_confirmation(const char *filename) {
+      |             ^~~~~~~~~~~~~~~~~~~~~~~
+ninja: build stopped: subcommand failed.
+ninja failed with exit code 1, output of the command is in the C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stderr_output_29748 and C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI\build\log\idf_py_stdout_output_29748
+C:\Users\cmshe\eez-projects\CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI>
+Show more
+
+
+Identified missing file_browser_click_cb function
+file_browser_click_cb is missing from your file (the warning about show_print_confirmation being "defined but not used" confirms it — nothing is calling it). Add this function before app_main:
+
+static void file_browser_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (!label) return;
+    const char *filename = lv_label_get_text(label);
+    if (!filename || strlen(filename) == 0) return;
+
+    show_print_confirmation(filename);
+}
+
+Place it right after show_print_confirmation (around line 130), before the tasks section. That resolves both the error and the "unused function" warning.
+
+
+Copy
+
+
+seeem I need to figure out the time setting issue, since touching backgroung of main screen also triggers the time telling screen.                      I (935) efuse_init: Max chip rev:     v0.99
+I (939) efuse_init: Chip rev:         v0.2
+I (943) heap_init: Initializing. RAM available for dynamic allocation:
+I (950) heap_init: At 3FC9EEF8 len 0004A818 (298 KiB): RAM
+I (955) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (960) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (965) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+I (970) esp_psram: Adding pool of 6464K of PSRAM memory to heap allocator
+I (977) esp_psram: Adding pool of 41K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (988) spi_flash: detected chip: generic
+I (992) spi_flash: flash io: qio
+I (995) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (1001) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (1008) main_task: Started on CPU0
+I (1021) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (1021) main_task: Calling app_main()
+I (1023) DISPLAY: I2C Bus successfully initialized!
+I (1027) STC8H1K28: stc8h1k28 initialized successfully
+I (1032) DISPLAY: stc8h1k28 successfully initialized
+I (1036) DISPLAY: Install Touch driver
+I (1040) DISPLAY: Create LCD panel IO handle
+I (1044) DISPLAY: Create a new GT911 touch driver
+I (1048) GT911: Start touch_gt911_read_cfg
+I (1053) GT911: TouchPad_ID:0x39,0x31,0x31
+I (1056) GT911: TouchPad_Config_Version:255
+I (1060) GT911: TouchPad X 1:3
+I (1063) GT911: TouchPad X 0:32
+I (1066) GT911: TouchPad X resolution:800
+I (1069) GT911: TouchPad Y resolution:480
+I (1073) BM8563: BM8563 initialized successfully
+I (1077) DISPLAY: bm8563 successfully initialized
+I (1082) DISPLAY: Install RGB LCD panel driver
+I (1086) DISPLAY: Create RGB LCD panel
+I (1134) DISPLAY: Register event callbacks
+I (1134) DISPLAY: Initialize RGB LCD panel
+I (1134) DISPLAY: RGB LCD panel driver completely initialized.
+I (1136) DISPLAY: Initialize LVGL library
+I (1140) DISPLAY: Use frame buffers as LVGL draw buffers
+I (1145) DISPLAY: Register display driver to LVGL
+I (1151) DISPLAY: Register input device driver to LVGL
+I (1154) DISPLAY: Start lv_timer_handler task
+I (1158) DISPLAY: Starting LVGL task
+I (1159) MAIN: Start LVGL
+I (1165) MAIN: RTC: 2026-11-16 11:44:17
+I (2031) main_task: Returned from app_main()
+I (12033) TIME: Time setting action triggered.
+I (18137) TIME: Time saved: 2026-11-16 11:44
+I (21511) TIME: Time setting action triggered.
+I (26257) TIME: Time saved: 2026-11-16 11:44
+I (30622) TIME: Time setting action triggered.
+I (35411) TIME: Time saved: 2026-11-16 11:44
+I (45700) TIME: Time setting action triggered.
+I (51519) TIME: Time saved: 2026-11-16 11:44
+I (64821) TIME: Time setting action triggered.
+I (70576) TIME: Time saved: 2026-11-16 11:44
+I (77479) TIME: Time setting action triggered.
+I (80046) TIME: Time saved: 2026-11-16 11:44
+I (83822) TIME: Time setting action triggered.
+I (86076) TIME: Time saved: 2026-11-16 11:44
+I (90027) TIME: Time setting action triggered.
+I (92532) TIME: Time saved: 2026-11-16 11:44
+Show more
+
+
+Identified EEZ Studio screen event binding error
+This is an EEZ Studio layout issue, not a code issue. The "Set Time" action is attached to the screen background (or a large container) instead of a specific button.
+
+How to fix in EEZ Studio
+Open the main screen in EEZ Studio
+Click on the background/screen object (the outermost container)
+In the Events tab (right panel), look for a CLICKED or PRESS event that has the "Set Time" action
+Remove that event from the background
+Make sure the "Set Time" action is only on a dedicated button (a small, visible button the user intentionally taps)
+If you don't see a separate "Set Time" button in your layout, that's the problem — the AI-generated UI likely bound the action to the screen itself instead of creating a proper button. Add a small button (e.g. a clock icon or "⚙" text) and attach the time-setting action to that button only.
+
+Quick check
+In EEZ Studio, select each object on the main screen and look at its Events tab. The object that has "Time setting action triggered" is the one you need to fix. It should be a small button, not the 800×480 screen container.
+
+
+Copy
+
+
+that was it, that fixed that, I did that not knowing what I am doing. now it only pops up with the settings button
+
+
+Acknowledged fix confirmation
+Nice, that's it then. The AI-generated UI had bound the time-setting action to the screen background instead of a dedicated button — a common mistake when auto-generating layouts.
+
+So you're now at a solid point:
+
+✅ File list displays and is selectable
+✅ Confirmation dialog before printing
+✅ Modal overlay blocks background clicks
+✅ Time setting only triggers from the settings button
+What's next on your list — progress tracking (M27), temperature control, or something else?
+
+
+Copy
+
+
+now when I press the file, is does not bring up the conformation any more.  here is my main.cpp  I most likely  did it wrong.                          #include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "lvgl.h"
+#include "display/esp32_s3.h"
+#include "ui/ui.h"
+#include "stc8h1k28.h"
+#include "driver/uart.h"
+#include <time.h>
+#include <sys/time.h>
+
+#define MARLIN_UART_NUM     UART_NUM_1
+#define MARLIN_TX_PIN       GPIO_NUM_20
+#define MARLIN_RX_PIN       GPIO_NUM_19
+#define SERIAL_BUF_SIZE     1024
+#define MAX_GCODE_LEN       64
+#define COMMAND_QUEUE_LEN   20
+
+#define LOG_QUEUE_LEN       64
+#define LOG_LINE_MAX        512
+#define MAX_FILES           50
+#define FILE_NAME_LEN       64
+
+static void update_file_browser_ui(void);
+
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+typedef struct {
+    char line[LOG_LINE_MAX];
+} log_item_t;
+
+// ─── Globals ─────────────────────────────────────────────────────────────────
+
+extern "C" QueueHandle_t log_queue = NULL;
+
+QueueHandle_t marlin_cmd_queue = NULL;
+
+static stc8h1k28_handle_t stc8 = NULL;
+static const char *TAG = "MAIN";
+
+bool marlin_connected = false;
+bool isPrinting = false;
+uint32_t last_marlin_reply_ms = 0;
+
+// M20 file list state
+static char file_list[MAX_FILES][FILE_NAME_LEN];
+static int file_count = 0;
+static bool capturing_files = false;
+
+// ─── Forward declarations ────────────────────────────────────────────────────
+
+extern "C" void update_clock_labels_timer(lv_timer_t *timer);
+void parse_marlin_line(const char *line);
+
+// ─── Log queue ───────────────────────────────────────────────────────────────
+
+void log_queue_init(void) {
+    log_queue = xQueueCreate(LOG_QUEUE_LEN, sizeof(log_item_t));
+}
+
+void append_print_log(const char *line) {
+    if (log_queue == NULL) return;
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "%s", line);
+    xQueueSend(log_queue, &item, 0);
+}
+
+// ─── G-code send ─────────────────────────────────────────────────────────────
+
+extern "C" void send_gcode(const char *command) {
+    if (!command) return;
+    if (marlin_cmd_queue != NULL) {
+        xQueueSend(marlin_cmd_queue, command, 0);
+    }
+    if (log_queue != NULL) {
+        log_item_t item;
+        snprintf(item.line, LOG_LINE_MAX, "> %s", command);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+
+// ─── File browser ────────────────────────────────────────────────────────────
+
+static void update_file_browser_ui(void) {
+    if (log_queue == NULL) return;
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "LIST_CLEAR");
+    xQueueSend(log_queue, &item, 0);
+    for (int i = 0; i < file_count; i++) {
+        snprintf(item.line, LOG_LINE_MAX, "LIST_ADD:%.63s", file_list[i]);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+
+static char pending_filename[FILE_NAME_LEN] = {0};
+
+static lv_obj_t *modal_overlay = NULL;
+
+static void confirm_print_cb(lv_event_t *e) {
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    uint16_t btn_idx = lv_msgbox_get_active_btn(mbox);
+
+    if (btn_idx == 0) {  // "Print"
+        char cmd[80];
+        snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+        send_gcode(cmd);
+        isPrinting = true;
+    }
+
+    if (mbox) lv_obj_del(mbox);
+    if (modal_overlay) {
+        lv_obj_del(modal_overlay);
+        modal_overlay = NULL;
+    }
+}
+
+static void show_print_confirmation(const char *filename) {
+    snprintf(pending_filename, sizeof(pending_filename), "%s", filename);
+
+    // Full-screen overlay to block clicks to the main screen
+    lv_obj_t *scr = lv_obj_get_screen(NULL);
+    modal_overlay = lv_obj_create(scr);
+    lv_obj_set_size(modal_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(modal_overlay, 0, 0);
+    lv_obj_set_style_bg_opa(modal_overlay, LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(modal_overlay, lv_color_black(), 0);
+    lv_obj_add_flag(modal_overlay, LV_OBJ_FLAG_CLICKABLE);  // absorbs all touches
+
+    static const char *btn_labels[] = {"Print", "Cancel", NULL};
+    lv_obj_t *mbox = lv_msgbox_create(modal_overlay, "Confirm Print", filename, btn_labels, false);
+    lv_obj_center(mbox);
+    lv_obj_add_event_cb(mbox, confirm_print_cb, LV_EVENT_VALUE_CHANGED, NULL);
+} 
+
+static void file_browser_click_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (!label) return;
+    const char *filename = lv_label_get_text(label);
+    if (!filename || strlen(filename) == 0) return;
+
+    show_print_confirmation(filename);
+}   
+  
+// ─── Marlin line parser ──────────────────────────────────────────────────────
+
+void parse_marlin_line(const char *line) {
+    if (line == NULL || strlen(line) == 0) return;
+
+    // Temperature updates
+    float hcur = -1, bcur = -1, dcur = -1;
+    const char *tPos = strstr(line, "T:");
+    if (tPos) sscanf(tPos, "T:%f", &hcur);
+    const char *bPos = strstr(line, "B:");
+    if (bPos) sscanf(bPos, "B:%f", &bcur);
+    const char *cPos = strstr(line, "C:");
+    if (cPos) sscanf(cPos, "C:%f", &dcur);
+
+    char buf[16];
+    if (hcur >= 0 && objects.nozzle_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", hcur);
+        lv_label_set_text(objects.nozzle_temp_main_screen, buf);
+    }
+    if (bcur >= 0 && objects.bed_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", bcur);
+        lv_label_set_text(objects.bed_temp_main_screen, buf);
+    }
+    if (dcur >= 0 && objects.drivers_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", dcur);
+        lv_label_set_text(objects.drivers_temp_main_screen, buf);
+    }
+
+    // M20 file list parsing
+    if (strcmp(line, "Begin file list") == 0) {
+        file_count = 0;
+        capturing_files = true;
+        return;
+    }
+    if (strcmp(line, "End file list") == 0) {
+        capturing_files = false;
+        update_file_browser_ui();
+        return;
+    }
+    if (capturing_files && file_count < MAX_FILES) {
+        const char *name = line;
+
+        char *colon = strchr(line, ':');
+        if (colon && (colon - line) < 3) {
+            name = colon + 1;
+        }
+
+        char *tmp = (char *)name;
+        char *last_space = strrchr(tmp, ' ');
+        if (last_space) {
+            char *size_str = last_space + 1;
+            bool is_size = (size_str[0] != '\0');
+            for (char *p = size_str; *p; p++) {
+                if (*p < '0' || *p > '9') { is_size = false; break; }
+            }
+            if (is_size) *last_space = '\0';
+        }
+
+        snprintf(file_list[file_count], FILE_NAME_LEN, "%.63s", tmp);
+        file_count++;
+    }
+
+    // ← ADDED: detect print start / completion from Marlin
+    if (strstr(line, "Start SD print job:")) {
+        isPrinting = true;
+    }
+    if (strstr(line, "Done printing file")) {
+        isPrinting = false;
+    }
+}
+
+// ─── Tasks ───────────────────────────────────────────────────────────────────
+
+static void marlin_tx_task(void *arg) {
+    char cmd[MAX_GCODE_LEN];
+    while (1) {
+        if (xQueueReceive(marlin_cmd_queue, cmd, portMAX_DELAY)) {
+            size_t len = strlen(cmd);
+            if (cmd[len - 1] != '\n') {
+                cmd[len] = '\n';
+                len++;
+            }
+            uart_write_bytes(MARLIN_UART_NUM, cmd, len);
+            uart_wait_tx_done(MARLIN_UART_NUM, pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+static void marlin_rx_task(void *arg) {
+    uint8_t rx_buf[256];
+    static char line_accumulator[512];
+    static size_t line_pos = 0;
+
+    while (1) {
+        int len = uart_read_bytes(MARLIN_UART_NUM, rx_buf, sizeof(rx_buf) - 1, pdMS_TO_TICKS(20));
+        if (len > 0) {
+            last_marlin_reply_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            marlin_connected = true;
+
+            for (int i = 0; i < len; i++) {
+                char c = (char)rx_buf[i];
+                if (c == '\n') {
+                    line_accumulator[line_pos] = '\0';
+                    if (line_pos > 0) {
+                        parse_marlin_line(line_accumulator);
+
+                        if (strstr(line_accumulator, "T:") == NULL &&
+                            strcmp(line_accumulator, "ok") != 0 &&
+                            strncmp(line_accumulator, "ok ", 3) != 0 &&
+                            !capturing_files &&
+                            strcmp(line_accumulator, "Begin file list") != 0 &&
+                            strcmp(line_accumulator, "End file list") != 0) {
+                            append_print_log(line_accumulator);
+                        }
+                    }
+                    line_pos = 0;
+                } else if (c != '\r' && line_pos < sizeof(line_accumulator) - 1) {
+                    line_accumulator[line_pos++] = c;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void status_poller_task(void *arg) {
+    while (1) {
+        if (isPrinting) send_gcode("M27");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+static void watchdog_task(void *arg) {
+    while (1) {
+        if (marlin_connected &&
+            (xTaskGetTickCount() * portTICK_PERIOD_MS - last_marlin_reply_ms > 8000)) {
+            marlin_connected = false;
+            uart_flush(MARLIN_UART_NUM);
+            xQueueSend(marlin_cmd_queue, "M105", 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// ─── App main ────────────────────────────────────────────────────────────────
+
+extern "C" void app_main(void)
+{
+    init_display();
+    ESP_LOGI(TAG, "Start LVGL");
+
+    // RTC
+    struct tm rtc_time = {};
+    if (bm8563_get_time(rtc_handle, &rtc_time) == ESP_OK) {
+        ESP_LOGI(TAG, "RTC: %04d-%02d-%02d %02d:%02d:%02d",
+                 rtc_time.tm_year + 1900, rtc_time.tm_mon + 1, rtc_time.tm_mday,
+                 rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+        time_t t = mktime(&rtc_time);
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+    }
+
+    // Boot beep
+    stc8 = stc8h1k28_get_handle();
+    stc8h1k28_buzzer_on(stc8);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    stc8h1k28_buzzer_off(stc8);
+
+    // UART
+    uart_config_t uart_config = {};
+    uart_config.baud_rate   = 115200;
+    uart_config.data_bits   = UART_DATA_8_BITS;
+    uart_config.parity      = UART_PARITY_DISABLE;
+    uart_config.stop_bits   = UART_STOP_BITS_1;
+    uart_config.flow_ctrl   = UART_HW_FLOWCTRL_DISABLE;
+    uart_config.source_clk  = UART_SCLK_DEFAULT;
+
+    uart_param_config(MARLIN_UART_NUM, &uart_config);
+    uart_set_pin(MARLIN_UART_NUM, MARLIN_TX_PIN, MARLIN_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(MARLIN_UART_NUM, SERIAL_BUF_SIZE * 2, 0, 0, NULL, 0);
+
+    // Queues
+    log_queue_init();
+    marlin_cmd_queue = xQueueCreate(COMMAND_QUEUE_LEN, MAX_GCODE_LEN);
+
+    // UI
+    if (lvgl_port_lock(portMAX_DELAY)) {
+        ui_init();
+        if (objects.print_status_log) {
+            lv_textarea_set_text(objects.print_status_log, "");
+        }
+        // ← ADDED: attach click handler to file list
+        if (objects.file_browser_list) {
+            lv_obj_add_event_cb(objects.file_browser_list, file_browser_click_cb, LV_EVENT_CLICKED, NULL);
+        }
+        lvgl_port_unlock();
+    }
+
+    // Tasks
+    xTaskCreate(marlin_rx_task,      "rx",   4096, NULL, 5, NULL);
+    xTaskCreate(marlin_tx_task,      "tx",   3072, NULL, 3, NULL);
+    xTaskCreate(status_poller_task,  "poll", 2048, NULL, 2, NULL);
+    xTaskCreate(watchdog_task,       "wd",   2048, NULL, 1, NULL);
+
+    lv_timer_create(update_clock_labels_timer, 1000, NULL);
+
+    // Initial link
+    send_gcode("M155 S2");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    send_gcode("M20");  // ← ADDED: request file list on boot
+}
+Show more
+
+
+Error
+Something went wrong
+
+Try again
+
+Copy
+
+
+guess my files to long?
+
+
+Diagnosed lv_obj_get_screen(NULL) bug
+No, file name length isn't the issue (64 chars is plenty). The problem is lv_obj_get_screen(NULL) — in LVGL 8 that's not the right way to get the active screen. Use lv_scr_act() instead.
+
+Fix in show_print_confirmation
+Change this line:
+
+lv_obj_t *scr = lv_obj_get_screen(NULL);
+
+To:
+
+lv_obj_t *scr = lv_scr_act();
+
+lv_scr_act() returns the currently active screen in LVGL 8. lv_obj_get_screen(NULL) likely returns NULL, which means lv_obj_create(NULL) silently fails and the overlay + msgbox never appear.
+
+Quick debug tip
+If it still doesn't work after that fix, add a log at the top of file_browser_click_cb to confirm the callback is even firing:
+
+static void file_browser_click_cb(lv_event_t *e) {
+    ESP_LOGI(TAG, "File clicked");
+    lv_obj_t *btn = lv_event_get_target(e);
+    if (!btn) return;
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (!label) return;
+    const char *filename = lv_label_get_text(label);
+    ESP_LOGI(TAG, "Filename: %s", filename);
+    if (!filename || strlen(filename) == 0) return;
+
+    show_print_confirmation(filename);
+}
+
+If you see "File clicked" in the serial log but no dialog, it's the screen issue. If you don't even see "File clicked", the event isn't reaching the callback (bubbling issue).
+
+
+Copy
+
+
+ok I click yes to print, but nothing happens other that in console it shows                                                                                                                                                SD printing byte 0/7829494                                                                                     >M27                                                                                                          SD printing byte 0/7829494                                                                                     >M27                                                                                                          SD printing byte 0/7829494                                                                                     >M27                                                                                    machine not responding, so is it acually reading the gcode?
+Show more
+
+
+Diagnosed stuck SD print at byte 0
+The machine is responding — Marlin opened the file (7.8 MB) and entered SD printing mode. It's just not executing because the axes aren't homed. Marlin refuses to run G-code movements until you've done G28.
+
+Fix
+In confirm_print_cb, send G28 before M23:
+
+if (btn_idx == 0) {  // "Print"
+    send_gcode("G28");       // ← home all axes first
+    vTaskDelay(pdMS_TO_TICKS(3000));  // wait for homing to finish
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+    send_gcode(cmd);
+    isPrinting = true;
+}
+
+If your printer is usually already homed (e.g. you homed it manually before selecting a file), you can skip the G28 and just make sure to home it once before printing. But sending it every time is the safe default.
+
+Note: The 3-second delay is a rough guess — homing can take 5–10 seconds depending on your printer. A more robust approach would be to wait for Marlin to reply with ok after G28, but for now a fixed delay of ~5 seconds is safer:
+
+vTaskDelay(pdMS_TO_TICKS(5000));
+
+
+Copy
+
+
+ok the file                         starts like this                                                                 ; EXECUTABLE_BLOCK_START
+M73 P0 R201
+M201 X3000 Y3000 Z100 E5000
+M203 X150 Y150 Z5 E60
+M204 P5000 R1000 T0 ; sets acceleration (P, T) and retract acceleration (R), mm/sec^2
+M205 X8.00 Y8.00 Z0.40 E5.00 ; sets the jerk limits, mm/sec
+M205 J0.010
+;TYPE:Custom
+; --- 1. Set Initial Temperatures (Non-blocking) ---
+M140 S70 ; Set bed temp without waiting yet
+M104 S245     ; Set nozzle temp without waiting yet
+
+; --- 2. Home and Align ---
+G28                                 ; Home all axes (Z homes via BDsensor)
+
+; --- 3. Wait for Temperatures ---
+M190 S70 ; Wait for bed to reach target temp
+M109 S245     ; Wait for nozzle to reach target temp
+
+; --- 5. Purge Line / Prime Nozzle ---
+G90                                 ; Absolute positioning
+G92 E0                              ; Reset Extruder
+G1 Z5.0 F1200                       ; Move Z Axis up
+G1 X1.1 Y20 Z0.28 F1500.0           ; Move to start position
+G1 X1.1 Y100.0 Z0.28 F1500.0 E15     ; Draw the first line
+G1 X1.4 Y100.0 Z0.28 F1500.0        ; Move to side a little
+G1 X1.4 Y20 Z0.28 F1500.0 E30       ; Draw the second line
+G1 Z5 F900                          ; Lower Z a little
+G92 E0                              ; Reset Extruder
+G1 X110 Y110 F2000                  ; Move X and Y to middle of bed
+G90
+G21
+M83 ; use relative distances for extrusion
+; Filament gcode
+M106 S0
+;LAYER_CHANGE
+;Z:0.2
+;HEIGHT:0.2
+;BEFORE_LAYER_CHANGE
+;0.2
+G92 E0
+
+G1 E-.8 F1800
+;_SET_FAN_SPEED_CHANGING_LAYER
+M204 P100
+M205 X8 Y8
+M204 T3000
+G1 X227.992 Y151.516 F15000
+G1 Z.6
+G1 Z.2
+M73 P0 R200
+G1 E.8 F1800
+;TYPE:Brim
+;WIDTH:0.42
+G1 F4800
+G1 X228.266 Y151.144 E.01377
+G1 X228.667 Y150.681 E.01823
+Show more
+
+
+Diagnosed SD print stuck at byte 0
+Yes, it is reading and executing the G-code. The file is open (7.8 MB confirmed). Your printer is almost certainly stuck at:
+
+M190 S70    ; Wait for bed to reach 70°C
+M109 S245   ; Wait for nozzle to reach 118°C
+
+These are blocking commands — Marlin halts file execution until the temperatures are reached. The nozzle needs to heat from ambient to 245°F (118°C), which takes 5–15 minutes depending on your hotend.
+
+The "byte 0" in the M27 report is misleading — some Marlin versions don't advance the byte counter while blocked on a temperature wait.
+
+How to confirm it's working
+Watch the temperature labels on your HMI (the T: / B: values from M155 S2). If the nozzle temp is climbing toward 118°C and the bed toward 70°C, the print is progressing normally. Once both reach target, the byte counter will jump forward and you'll see the bed move (G28, purge lines, brim).
+
+You don't need to send G28 before M23
+Your G-code file already handles everything in the correct order:
+
+Set temps (non-blocking) → M140, M104
+Home → G28
+Wait for temps → M190, M109
+Purge → prime lines
+Print
+So remove the G28 + delay I suggested earlier — just send M23 <filename> and let the file do its thing. The confirmation callback should be:
+
+if (btn_idx == 0) {  // "Print"
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+    send_gcode(cmd);
+    isPrinting = true;
+}
+
+Just wait for the temps to hit and it'll start moving.
+
+
+Copy
+
+
+not doing nothing, silent, but if i click on my send gcode button, clicking home all homes printer, but nothing in sdcard is being comunicated
+
+
+Error
+Something went wrong
+
+Try again
+
+Copy
+
+
+temps not heating, not seeing any prompts on console about what it is accually reading
+
+
+Error
+Something went wrong
+
+Try again
+
+Copy
+
+
+sdcard issue?
+
+
+Verifying Marlin M23/M24 SD print sequence
+You're missing M24. M23 only selects (opens) the file — it doesn't start printing.  You need to send M24 to actually begin executing the G-code. 
+
+From the Marlin docs:
+
+M23: Select an SD file for printing. Follow with M24 to run the selected file. 
+
+Fix in confirm_print_cb
+if (btn_idx == 0) {  // "Print"
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+    send_gcode(cmd);
+    send_gcode("M24");   // ← THIS IS THE MISSING COMMAND
+    isPrinting = true;
+}
+
+That's it. M23 opens the file, M24 starts it. Without M24, the file sits open at byte 0 doing nothing — exactly what you're seeing.
+
+
+Copy
+
+
+thanks that worked , does as read fron sdcard
+
+
+Confirmed SD card print
+Nice, so the full flow is working now:
+
+✅ File list populates on boot (M20)
+✅ Tap filename → confirmation dialog
+✅ "Print" → M23 + M24 → print starts
+✅ M27 polling shows progress
+What's next — do you want to work on the progress bar / percentage display from the M27 reports, or something else?
+
+
+Copy
+
+
+ok this main screen was created by aI , while it looks nice, the print button, that brings up the print screen is completely bypasses by the file browser. the print screen has the info , job progress the pause, cancel change filament...
+Show more
+
+
+Resolved EEZ Studio z-order overlap
+That's a layout overlap in EEZ Studio — the file_browser_list container is positioned on top of (or covering) the "Print" button, so your taps hit the file list instead of navigating to the print screen.
+
+Fix in EEZ Studio
+Open the main screen
+Select the file_browser_list container
+In the Position & Size panel (right side), adjust its Y position or height so it doesn't overlap the "Print" button
+Make sure the "Print" button is below (or beside) the file list, not underneath it
+Typical layout for a 800×480 screen:
+
+┌──────────────────────────────────────────┐
+│  Temps / Status (top bar)                │  ~80px
+├──────────────────────────────────────────┤
+│                                          │
+│  File Browser (scrollable)               │  ~280px
+│  ┌──────────────────────────────────┐    │
+│  │ file1.g                          │    │
+│  │ file2.g                          │    │
+│  │ file3.g                          │    │
+│  └──────────────────────────────────┘    │
+│                                          │
+├──────────────────────────────────────────┤
+│  [Print]  [Settings]  [Clock]           │  ~60px
+└──────────────────────────────────────────┘
+
+The key rule: no object should be on top of another unless you intentionally want the top one to intercept clicks. Since the file list is scrollable, give it a fixed height that ends above your button row.
+
+If they must overlap (e.g. a floating button)
+In EEZ Studio, select the "Print" button and use "Bring to Front" (or reorder it after the file_browser_list in the object tree). But the cleaner fix is just to not overlap them.
+
+
+Copy
+
+
+Well cannot seen to get to paste pictures here any more. I guess the confusion is going direct to printing a file from the file browswer, and completely by passing the print screen. i can manually press the print button and get there.
+
+
+Identified print screen navigation fix
+Got it — so the flow should be:
+
+Tap file in browser → confirm → M23 + M24 → navigate to the print screen (where progress/pause/cancel live)
+The "Print" button on main is just a shortcut to check on an already-running print
+Fix
+In confirm_print_cb, after sending M24, switch to the print screen:
+
+if (btn_idx == 0) {  // "Print"
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+    send_gcode(cmd);
+    send_gcode("M24");
+    isPrinting = true;
+
+    lv_scr_load(screens.print_screen);  // ← navigate to print screen
+}
+
+Check your screens.h (in the ui/ folder) for the exact name — it's probably something like screens.print_screen or screens.screen_2 depending on what you named it in EEZ Studio.
+
+The "Print" button on the main screen already has its own EEZ Studio action to navigate there, so that stays as-is for manual access.
+
+
+Copy
+
+
+// Screens
+
+enum ScreensEnum {
+    _SCREEN_ID_FIRST = 1,
+    SCREEN_ID_MAIN_SCREEN = 1,
+    SCREEN_ID_PRINT_SCREEN = 2,
+    SCREEN_ID_STEPPER_DRIVER_SCREEN = 3,
+    SCREEN_ID_Z_STEPPER_DRIVER_SCREEN = 4,
+    SCREEN_ID_JOG_SCREEN = 5,
+    SCREEN_ID_FILAMENT_CHANGE_SCREEN = 6,
+    SCREEN_ID_MOTION_SCREEN = 7,
+    SCREEN_ID_SETTING_SCREEN = 8,
+    SCREEN_ID_MORE_SETTINGS_SCREEN = 9,
+    SCREEN_ID_XTRA_SETTINGS_SCREEN = 10,
+    SCREEN_ID_SCREEN_CALIBRATE = 11,
+    SCREEN_ID_INFO_SCREEN = 12,
+    SCREEN_ID_TEMPLATE_SCREEN = 13,
+    SCREEN_ID_TIME_DATE_SETTING_SCREEN = 14,
+    _SCREEN_ID_LAST = 14
+};
+
+typedef struct _objects_t {
+    lv_obj_t *main_screen;
+    lv_obj_t *print_screen;
+    lv_obj_t *stepper_driver_screen;
+    lv_obj_t *z_stepper_driver_screen;
+    lv_obj_t *jog_screen;
+    lv_obj_t *filament_change_screen;
+    lv_obj_t *motion_screen;
+    lv_obj_t *setting_screen;
+    lv_obj_t *more_settings_screen;
+    lv_obj_t *xtra_settings_screen;
+    lv_obj_t *screen_calibrate;
+    lv_obj_t *info_screen;
+    lv_obj_t *template_screen;
+    lv_obj_t *time_date_setting_screen;
+    lv_obj_t *obj0;
+    lv_obj_t *print_ready_label_main_screen;
+    lv_obj_t *obj1;
+    lv_obj_t *obj2;
+    lv_obj_t *printer_1;
+    lv_obj_t *job_label_main_screen;
+    lv_obj_t *time_label_main_screen;
+    lv_obj_t *wifi_icon_main_screen;
+Show more
+
+
+Identified lv_scr_load variable
+There it is — it's objects.print_screen. So in confirm_print_cb:
+
+if (btn_idx == 0) {  // "Print"
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "M23 %s", pending_filename);
+    send_gcode(cmd);
+    send_gcode("M24");
+    isPrinting = true;
+
+    lv_scr_load(objects.print_screen);  // ← this
+}
+
+objects.print_screen is already declared in your ui.h (the _objects_t struct), so no extra includes needed.
+
+
+Copy
+
+
+ok Thanks,  seems to be working .  I have yet to wire all the code on the print screen , i was focused on main screen.  it does seem the display has no knollage if the printer is on.
+
+
+
+Parsed M27 response and updated print screen labels
+You need to parse the M27 response and store the progress. Marlin replies with:
+
+SD printing byte 123456/7829494
+
+Add globals (near your other file browser state)
+// Print progress state
+static uint32_t print_bytes_current = 0;
+static uint32_t print_bytes_total = 0;
+static char current_job[FILE_NAME_LEN] = {0};
+
+Add M27 parsing in parse_marlin_line
+Add this block (after the temperature parsing, before the M20 section):
+
+// M27 progress: "SD printing byte 123456/7829494"
+if (strncmp(line, "SD printing byte ", 17) == 0) {
+    unsigned long cur = 0, tot = 0;
+    if (sscanf(line + 17, "%lu/%lu", &cur, &tot) == 2) {
+        print_bytes_current = cur;
+        print_bytes_total = tot;
+    }
+    return;
+}
+
+Store the job name when M23 is sent
+In confirm_print_cb, before lv_scr_load:
+
+snprintf(current_job, sizeof(current_job), "%s", pending_filename);
+
+Update the print screen on navigation
+In app_main, after ui_init(), or better — create a small helper you call when loading the print screen. The simplest approach: update labels in the LVGL task tick. Add to the queue-draining section in esp32_s3.c (after the log batch logic), or just call it from a timer.
+
+Easiest: add a periodic update in main.cpp via an LVGL timer:
+
+static void update_print_screen_timer(lv_timer_t *timer) {
+    (void)timer;
+    if (!isPrinting) return;
+
+    // Update job label
+    if (objects.job_label_print_screen) {
+        lv_label_set_text(objects.job_label_print_screen, current_job);
+    }
+
+    // Update progress (percentage)
+    if (objects.job_progress_label_print_screen && print_bytes_total > 0) {
+        char buf[32];
+        int pct = (int)((print_bytes_current * 100) / print_bytes_total);
+        snprintf(buf, sizeof(buf), "%d%%", pct);
+        lv_label_set_text(objects.job_progress_label_print_screen, buf);
+    }
+}
+
+Then in app_main, after lv_timer_create(update_clock_labels_timer, ...):
+
+lv_timer_create(update_print_screen_timer, 1000, NULL);
+
+Note: You'll need to check the exact label names in your objects struct for the print screen (e.g. job_label_print_screen, job_progress_label_print_screen). Look in your ui.h for the print screen labels and use those names.
+
+Also: show status on main screen
+You already have print_ready_label_main_screen — update it in the same timer:
+
+if (objects.print_ready_label_main_screen) {
+    lv_label_set_text(objects.print_ready_label_main_screen, isPrinting ? "PRINTING" : "READY");
+}
+
+That gives you the "is the printer on" knowledge on both screens.
+
+Elaborate
+How do I handle SD card errors during printing?
+Can I pause or cancel a print via UI?
+How to display the current print speed?
+
+Copy
+
+Try again
+
+

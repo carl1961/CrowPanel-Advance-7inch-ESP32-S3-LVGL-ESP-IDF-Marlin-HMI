@@ -1,0 +1,24 @@
+void app_main(void)
+{
+    init_display();
+    ESP_LOGI(TAG, "Start LVGL");
+
+    if (lvgl_port_lock(-1)) {
+        ui_init();
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "UI initialized successfully!");
+    } else {
+        ESP_LOGE(TAG, "Failed to lock LVGL port for UI initialization");
+    }
+
+    // ← buzzer code goes HERE, inside app_main()
+    stc8 = stc8h1k28_get_handle();
+    ESP_LOGI(TAG, "STC8 handle: %p", (void*)stc8);
+
+    esp_err_t err = stc8h1k28_buzzer_on(stc8);
+    ESP_LOGI(TAG, "buzzer_on: %s", esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(500));
+    err = stc8h1k28_buzzer_off(stc8);
+    ESP_LOGI(TAG, "buzzer_off: %s", esp_err_to_name(err));
+}   
+

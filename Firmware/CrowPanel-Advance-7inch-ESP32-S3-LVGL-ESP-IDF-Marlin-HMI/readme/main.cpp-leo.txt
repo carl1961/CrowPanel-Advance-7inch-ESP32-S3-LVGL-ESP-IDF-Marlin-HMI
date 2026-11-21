@@ -1,0 +1,295 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "lvgl.h"
+#include "display/esp32_s3.h"
+#include "ui/ui.h"
+#include "stc8h1k28.h"
+#include "driver/uart.h"
+#include <time.h>
+#include <sys/time.h>
+
+#define MARLIN_UART_NUM     UART_NUM_1
+#define MARLIN_TX_PIN       GPIO_NUM_20
+#define MARLIN_RX_PIN       GPIO_NUM_19
+#define SERIAL_BUF_SIZE     1024
+#define MAX_GCODE_LEN       64
+#define COMMAND_QUEUE_LEN   20
+
+#define LOG_QUEUE_LEN       64
+#define LOG_LINE_MAX        512
+#define MAX_FILES           50
+#define FILE_NAME_LEN       64
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+typedef struct {
+    char line[LOG_LINE_MAX];
+} log_item_t;
+
+// ─── Globals ─────────────────────────────────────────────────────────────────
+
+extern "C" QueueHandle_t log_queue = NULL;
+QueueHandle_t marlin_cmd_queue = NULL;
+
+static stc8h1k28_handle_t stc8 = NULL;
+static const char *TAG = "MAIN";
+
+bool marlin_connected = false;
+bool isPrinting = false;
+uint32_t last_marlin_reply_ms = 0;
+
+// M20 file list state
+static char file_list[MAX_FILES][FILE_NAME_LEN];
+static int file_count = 0;
+static bool capturing_files = false;
+
+// ─── Forward declarations ────────────────────────────────────────────────────
+
+extern "C" void update_clock_labels_timer(lv_timer_t *timer);
+void parse_marlin_line(const char *line);
+
+// ─── Log queue ───────────────────────────────────────────────────────────────
+
+void log_queue_init(void) {
+    log_queue = xQueueCreate(LOG_QUEUE_LEN, sizeof(log_item_t));
+}
+
+void append_print_log(const char *line) {
+    if (log_queue == NULL) return;
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "%s", line);
+    xQueueSend(log_queue, &item, 0);
+}
+
+// ─── G-code send ─────────────────────────────────────────────────────────────
+
+extern "C" void send_gcode(const char *command) {
+    if (!command) return;
+    if (marlin_cmd_queue != NULL) {
+        xQueueSend(marlin_cmd_queue, command, 0);
+    }
+    if (log_queue != NULL) {
+        log_item_t item;
+        snprintf(item.line, LOG_LINE_MAX, "> %s", command);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+// ─── File browser ────────────────────────────────────────────────────────────
+
+static void update_file_browser_ui(void) {
+    // Push clear + add commands through the log queue (drained in LVGL task)
+    if (log_queue == NULL) return;
+
+    log_item_t item;
+    snprintf(item.line, LOG_LINE_MAX, "LIST_CLEAR");
+    xQueueSend(log_queue, &item, 0);
+
+    for (int i = 0; i < file_count; i++) {
+        snprintf(item.line, LOG_LINE_MAX, "LIST_ADD:%s", file_list[i]);
+        xQueueSend(log_queue, &item, 0);
+    }
+}
+
+// ─── Marlin line parser ──────────────────────────────────────────────────────
+
+void parse_marlin_line(const char *line) {
+    if (line == NULL || strlen(line) == 0) return;
+
+    // Temperature updates
+    float hcur = -1, bcur = -1, dcur = -1;
+    const char *tPos = strstr(line, "T:");
+    if (tPos) sscanf(tPos, "T:%f", &hcur);
+    const char *bPos = strstr(line, "B:");
+    if (bPos) sscanf(bPos, "B:%f", &bcur);
+    const char *cPos = strstr(line, "C:");
+    if (cPos) sscanf(cPos, "C:%f", &dcur);
+
+    char buf[16];
+    if (hcur >= 0 && objects.nozzle_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", hcur);
+        lv_label_set_text(objects.nozzle_temp_main_screen, buf);
+    }
+    if (bcur >= 0 && objects.bed_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", bcur);
+        lv_label_set_text(objects.bed_temp_main_screen, buf);
+    }
+    if (dcur >= 0 && objects.drivers_temp_main_screen) {
+        snprintf(buf, sizeof(buf), "%.0f°", dcur);
+        lv_label_set_text(objects.drivers_temp_main_screen, buf);
+    }
+
+    // M20 file list parsing
+    if (strcmp(line, "Begin file list") == 0) {
+        file_count = 0;
+        capturing_files = true;
+        return;
+    }
+    if (strcmp(line, "End file list") == 0) {
+        capturing_files = false;
+        update_file_browser_ui();
+        return;
+    }
+    if (capturing_files && file_count < MAX_FILES) {
+        // Format: "0:filename.gcode  12345" or "1:SubFolder"
+        char *colon = strchr(line, ':');
+        if (colon) {
+            char *name = colon + 1;
+            // Strip trailing size (digits after last space)
+            char *last_space = strrchr(name, ' ');
+            if (last_space) {
+                char *size_str = last_space + 1;
+                bool is_size = (size_str[0] != '\0');
+                for (char *p = size_str; *p; p++) {
+                    if (*p < '0' || *p > '9') { is_size = false; break; }
+                }
+                if (is_size) *last_space = '\0';
+            }
+            snprintf(file_list[file_count], FILE_NAME_LEN, "%s", name);
+            file_count++;
+        }
+    }
+}
+
+// ─── Tasks ───────────────────────────────────────────────────────────────────
+
+static void marlin_tx_task(void *arg) {
+    char cmd[MAX_GCODE_LEN];
+    while (1) {
+        if (xQueueReceive(marlin_cmd_queue, cmd, portMAX_DELAY)) {
+            size_t len = strlen(cmd);
+            if (cmd[len - 1] != '\n') {
+                cmd[len] = '\n';
+                len++;
+            }
+            uart_write_bytes(MARLIN_UART_NUM, cmd, len);
+            uart_wait_tx_done(MARLIN_UART_NUM, pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+static void marlin_rx_task(void *arg) {
+    uint8_t rx_buf[256];
+    static char line_accumulator[512];
+    static size_t line_pos = 0;
+
+    while (1) {
+        int len = uart_read_bytes(MARLIN_UART_NUM, rx_buf, sizeof(rx_buf) - 1, pdMS_TO_TICKS(20));
+        if (len > 0) {
+            last_marlin_reply_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            marlin_connected = true;
+
+            for (int i = 0; i < len; i++) {
+                char c = (char)rx_buf[i];
+                if (c == '\n') {
+                    line_accumulator[line_pos] = '\0';
+                    if (line_pos > 0) {
+                        parse_marlin_line(line_accumulator);
+
+                        // Console: skip T: reports, bare "ok", and M20 list lines
+                        if (strstr(line_accumulator, "T:") == NULL &&
+                            strcmp(line_accumulator, "ok") != 0 &&
+                            strncmp(line_accumulator, "ok ", 3) != 0 &&
+                            !capturing_files &&
+                            strcmp(line_accumulator, "Begin file list") != 0 &&
+                            strcmp(line_accumulator, "End file list") != 0) {
+                            append_print_log(line_accumulator);
+                        }
+                    }
+                    line_pos = 0;
+                } else if (c != '\r' && line_pos < sizeof(line_accumulator) - 1) {
+                    line_accumulator[line_pos++] = c;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void status_poller_task(void *arg) {
+    while (1) {
+        if (isPrinting) send_gcode("M27");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+static void watchdog_task(void *arg) {
+    while (1) {
+        if (marlin_connected &&
+            (xTaskGetTickCount() * portTICK_PERIOD_MS - last_marlin_reply_ms > 8000)) {
+            marlin_connected = false;
+            // Re-link: flush and send M115
+            uart_flush(MARLIN_UART_NUM);
+            send_gcode("M115");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// ─── App main ────────────────────────────────────────────────────────────────
+
+extern "C" void app_main(void)
+{
+    init_display();
+    ESP_LOGI(TAG, "Start LVGL");
+
+    // RTC
+    struct tm rtc_time = {};
+    if (bm8563_get_time(rtc_handle, &rtc_time) == ESP_OK) {
+        ESP_LOGI(TAG, "RTC: %04d-%02d-%02d %02d:%02d:%02d",
+                 rtc_time.tm_year + 1900, rtc_time.tm_mon + 1, rtc_time.tm_mday,
+                 rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+        time_t t = mktime(&rtc_time);
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+    }
+
+    // Boot beep
+    stc8 = stc8h1k28_get_handle();
+    stc8h1k28_buzzer_on(stc8);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    stc8h1k28_buzzer_off(stc8);
+
+    // UART
+    uart_config_t uart_config = {};
+    uart_config.baud_rate   = 115200;
+    uart_config.data_bits   = UART_DATA_8_BITS;
+    uart_config.parity      = UART_PARITY_DISABLE;
+    uart_config.stop_bits   = UART_STOP_BITS_1;
+    uart_config.flow_ctrl   = UART_HW_FLOWCTRL_DISABLE;
+    uart_config.source_clk  = UART_SCLK_DEFAULT;
+
+    uart_param_config(MARLIN_UART_NUM, &uart_config);
+    uart_set_pin(MARLIN_UART_NUM, MARLIN_TX_PIN, MARLIN_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(MARLIN_UART_NUM, SERIAL_BUF_SIZE * 2, 0, 0, NULL, 0);
+
+    // Queues
+    log_queue_init();
+    marlin_cmd_queue = xQueueCreate(COMMAND_QUEUE_LEN, MAX_GCODE_LEN);
+
+    // UI
+    if (lvgl_port_lock(portMAX_DELAY)) {
+        ui_init();
+        if (objects.print_status_log) {
+            lv_textarea_set_text(objects.print_status_log, "");
+        }
+        lvgl_port_unlock();
+    }
+
+    // Tasks
+    xTaskCreate(marlin_rx_task,      "rx",   4096, NULL, 5, NULL);
+    xTaskCreate(marlin_tx_task,      "tx",   3072, NULL, 3, NULL);
+    xTaskCreate(status_poller_task,  "poll", 2048, NULL, 2, NULL);
+    xTaskCreate(watchdog_task,       "wd",   2048, NULL, 1, NULL);
+
+    lv_timer_create(update_clock_labels_timer, 1000, NULL);
+
+    // Initial link
+    send_gcode("M155 S2");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    send_gcode("M115");
+}   

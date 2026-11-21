@@ -1,0 +1,103 @@
+static void lvgl_port_task(void *arg)
+{
+    ESP_LOGI(TAG, "Starting LVGL task");
+
+    uint32_t task_delay_ms = LVGL_PORT_TASK_MAX_DELAY_MS; // Set initial task delay
+    while (1) {
+        if (lvgl_port_lock(-1)) { // Try to lock the LVGL mutex
+            task_delay_ms = lv_timer_handler(); // Handle LVGL timer events
+            
+            if (log_queue != NULL) {
+                char batch[1024] = {0};
+                size_t batch_len = 0;
+                log_item_t item;
+
+                while (xQueueReceive(log_queue, &item, 0) == pdTRUE) {
+                    if (strncmp(item.line, "LIST_ADD:", 9) == 0) {
+                        if (objects.file_browser_list) {
+                            lv_obj_t *btn = lv_btn_create(objects.file_browser_list);
+                            lv_obj_set_width(btn, LV_PCT(100));
+                            lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
+                            // ─── Customize the bubble here ───
+                            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1f1e1e), 0);
+                            lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+                            lv_obj_set_style_radius(btn, 24, 0);
+                            lv_obj_set_style_border_width(btn, 1, 0);
+                            lv_obj_set_style_border_color(btn, lv_color_hex(0xDEDEDE), 0);
+                            lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
+                            lv_obj_set_style_pad_ver(btn, 8, 0);
+                            lv_obj_set_style_pad_hor(btn, 12, 0);
+                            lv_obj_set_style_text_color(btn, lv_color_white(), 0);
+                            // ──────────────────────────────────
+                            lv_obj_t *label = lv_label_create(btn);
+                            
+                            // Clean up leading slash or subfolder path rendering safely
+                            const char *raw_name = item.line + 9;
+                            char clean_name[64];
+                            
+                            if (raw_name[0] == '/') {
+                                snprintf(clean_name, sizeof(clean_name), "%.63s", raw_name + 1);
+                            } else {
+                                snprintf(clean_name, sizeof(clean_name), "%.63s", raw_name);
+                            }
+
+                            lv_label_set_text(label, clean_name);
+                            lv_obj_center(label);
+                        }
+                    } else if (strcmp(item.line, "LIST_CLEAR") == 0) {
+						ESP_LOGI(TAG, "Executing LIST_CLEAR on file browser widget");
+                        if (objects.file_browser_list) {
+                            lv_obj_clean(objects.file_browser_list);
+                        }
+                        // Update header label with live onboard SD status and file count
+                        if (objects.files_dir_main_screen) {
+                            char status_buf[64];
+                            snprintf(status_buf, sizeof(status_buf), "SD CARD (%d FILES)", file_count);
+                            lv_label_set_text(objects.files_dir_main_screen, status_buf);
+                        }
+                    } else {
+                        if (batch_len < sizeof(batch) - 128) {
+                            batch_len += snprintf(batch + batch_len, sizeof(batch) - batch_len, "%s\n", item.line);
+                        }
+                    }
+					}    
+
+					// ONE set_text per tick, not N add_text calls
+					// Helper or inline block right after draining log_queue in lvgl_port_task:
+					if (batch_len > 0) {
+					lv_obj_t *targets[] = {
+					objects.print_status_log,
+					objects.print_status_log_print_screen
+					};
+
+					for (size_t t = 0; t < sizeof(targets) / sizeof(targets[0]); t++) {
+					lv_obj_t *ta = targets[t];
+					if (!ta) continue;
+
+					const char *existing = lv_textarea_get_text(ta);
+					size_t existing_len = existing ? strlen(existing) : 0;
+
+					if (existing_len + batch_len > 800) {
+					lv_textarea_set_text(ta, batch);
+					} else {
+					char combined[1024];
+					snprintf(combined, sizeof(combined), "%s%s", existing ? existing : "", batch);
+					lv_textarea_set_text(ta, combined);
+					}
+					lv_textarea_set_cursor_pos(ta, LV_TEXTAREA_CURSOR_LAST);
+					}
+				}
+				
+            
+            lvgl_port_unlock(); // Unlock the mutex
+        }
+        
+        // Ensure the delay time is within limits
+        if (task_delay_ms > LVGL_PORT_TASK_MAX_DELAY_MS) {
+            task_delay_ms = LVGL_PORT_TASK_MAX_DELAY_MS;
+        } else if (task_delay_ms < LVGL_PORT_TASK_MIN_DELAY_MS) {
+            task_delay_ms = LVGL_PORT_TASK_MIN_DELAY_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(task_delay_ms)); // Delay the task for the calculated time
+    }
+}

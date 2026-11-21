@@ -1,0 +1,59 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "lvgl.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "display/esp32_s3.h"
+#include "ui/ui.h"
+#include "stc8h1k28.h"
+#include "driver/i2c_master.h"
+ 
+
+static stc8h1k28_handle_t stc8 = NULL; 
+static const char* TAG = "MAIN";
+
+extern SemaphoreHandle_t lvgl_mux;
+
+
+void app_main(void)
+{
+    init_display();
+    ESP_LOGI(TAG, "Start LVGL");
+
+    if (lvgl_port_lock(portMAX_DELAY)) {
+        ui_init();
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "UI initialized successfully!");
+    } else {
+        ESP_LOGE(TAG, "Failed to lock LVGL port for UI initialization");
+    }
+
+    //  buzzer code 
+    stc8 = stc8h1k28_get_handle();
+    ESP_LOGI(TAG, "STC8 handle: %p", (void*)stc8);
+
+    esp_err_t err = stc8h1k28_buzzer_on(stc8);
+    ESP_LOGI(TAG, "buzzer_on: %s", esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(500));
+    err = stc8h1k28_buzzer_off(stc8);
+    ESP_LOGI(TAG, "buzzer_off: %s", esp_err_to_name(err));
+	
+	lv_timer_create(update_clock_labels_timer, 1000, NULL);
+	
+	// Keep app_main alive so the background tasks can run
+    while (1) {
+        if (lvgl_port_lock(portMAX_DELAY)) {
+            lv_timer_handler(); // Keep LVGL engine ticking [2]
+            lvgl_port_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+   
+

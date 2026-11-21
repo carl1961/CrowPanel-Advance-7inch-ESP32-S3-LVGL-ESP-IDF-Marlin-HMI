@@ -1,0 +1,28 @@
+Because rtc_handle in main.c is a different variable from the one inside display/esp32_s3.c. The display module has its own static handle that it assigns during init_display(). Your main.c has:
+
+static bm8563_handle_t rtc_handle = NULL;   // never assigned → stays NULL
+
+So bm8563_set_time(rtc_handle, &time_to_set) is passing NULL and failing.
+
+Same fix as the STC8 — add a getter in the display module:
+
+// display/esp32_s3.h
+bm8563_handle_t get_rtc_handle(void);
+
+// display/esp32_s3.c (where the display module stores its handle)
+bm8563_handle_t get_rtc_handle(void) {
+    return rtc_handle;   // the display module's own static
+}
+
+Then in main.c:
+
+#include "display/esp32_s3.h"
+
+void app_main(void)
+{
+    init_display();
+    rtc_handle = get_rtc_handle();   // ← borrow the handle
+    // ...
+}
+
+No double init, no extra I2C calls. Just grab the handle that init_display() already created.
