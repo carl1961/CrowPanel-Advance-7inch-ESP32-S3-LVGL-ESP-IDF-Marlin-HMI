@@ -21,3 +21,23 @@ Previously, incoming `T:` and `B:` telemetry lines in `main.cpp` set the LVGL ar
   extern "C" {
   #include "hmi_ui_sync.h"
   }
+## Troubleshooting
+
+### Status Log Cluttered by `M20` / `M21` / `M22` During Active Prints
+- **Cause:** SD card mount/list commands (`M20`, `M21`, `M22`) run on startup or screen logic and can keep firing during an active print, flooding the on-screen status log (`log_queue`) alongside `M27` byte progress.
+- **Fix:** Gate `M20` / `M21` / `M22` polling so those commands are skipped whenever an SD print is actively running (`M27` byte progress active / printing state), and only push high-signal or rate-limited lines into `log_queue`.
+
+### `X`, `Y`, and `Z` Axis Positions Not Updating After Screen Changes
+- **Cause:** Widget names or screen references can change after splitting or renaming screens in EEZ Studio (`print_screen`), or `M114` position polling / coordinate parsing may not be triggered or locked with `lvgl_port_lock(100)`.
+- **Fix:** Verify the exact `X`, `Y`, and `Z` label object names in `screens.h` / `main.cpp`, ensure `M114` responses (or move lines) parse `X:`, `Y:`, and `Z:` into those active `print_screen` labels, and wrap label updates in `lvgl_port_lock(100)` / `lvgl_port_unlock()`.
+
+### Long G-Code Filename Overlapping the Clock in the Top Header
+- **Cause:** Long filenames (such as `Test_calibration_cube_20x20mm.gcode`) can expand past the widget width or wrap/clip into the date/time label on `print_screen`.
+- **Fix:** Constrain the filename label width in EEZ Studio (or set `LV_LABEL_LONG_DOT` with `lv_label_set_long_mode(...)`) so long filenames truncate cleanly with `...` before reaching the clock.
+
+## Next Steps
+
+- [ ] Guard `M20` / `M21` / `M22` polling during active prints and keep `log_queue` focused on useful status messages.
+- [ ] Confirm `X`, `Y`, and `Z` coordinate labels on `print_screen` update reliably under `lvgl_port_lock(100)`.
+- [ ] Truncate long filenames in the `print_screen` header so the date and clock remain clear.
+- [ ] Clean up any remaining unused variable/function compiler warnings in `main.cpp` and `actions.c`.
