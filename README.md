@@ -1,8 +1,20 @@
 # CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI
 CrowPanel-Advance-7inch 3d printer controller
+FIRST I am not a programer! I am a copy cat, do what I read and am told.
+BUT what a world, with help from AI search and them spitting out code faster thay you can read it!
+am most the time it even compiles.  
+THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest and questions I will gladly answer.
 
-Prints! Lots work to tie things together.
-Fill free to fork and Make it better!
+
+Prints! Lots of work to yet do to tie things together.
+Fill free to fork and Make it better for your personal use!
+
+My goal poasting is to get a work going to optimize the printers working ability
+FULL open source. 
+
+OK first all the readme below is AI generated, it does not reflect my ability. these screen started with help from Gemini and Grok doing dark theme
+in these file or lots of readme of this AI adventure. EEZ Studio Dark Theme UI.pdf alone is grew to over 300 pages.
+ 
 ## Architecture, Temperature Sync & Build Notes
 
 ### Hardware & Firmware Architecture
