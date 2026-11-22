@@ -7,6 +7,23 @@ and most the time it even compiles.
 THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest and questions I will gladly answer.
 
 
+********************************************************************************************************************************
+11-22-2026   Progess
+
+Grok, Fixed tempeture arcs on PRINTER SCREEN
+Gemini, Fixed Cool  button and Preheat for PetG, this gets temps up without having to spin arcs and you can then fin tune
+Personally I quit using PLA after learning after a year no matter what you make breaks down and starts bio degrading.
+
+Gemini fixed and wired in the POPUP tune screen
+
+<img width="743" height="458" alt="image" src="https://github.com/user-attachments/assets/f311a8b6-225c-401d-8e3b-93ee0179a769" />
+
+every button worked!
+
+
+
+
+
 Prints! Lots of work to yet do to tie things together.
 Fill free to fork and Make it better for your personal use!
 
