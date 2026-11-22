@@ -11,6 +11,9 @@ THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest 
 11-22-2026   Progess
 
 Grok, Fixed tempeture arcs on PRINTER SCREEN
+
+
+
 Gemini, Fixed Cool  button and Preheat for PetG, this gets temps up without having to spin arcs and you can then fin tune
 Personally I quit using PLA after learning after a year no matter what you make breaks down and starts bio degrading.
 
