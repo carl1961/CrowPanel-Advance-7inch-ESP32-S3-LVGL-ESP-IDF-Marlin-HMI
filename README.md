@@ -1,8 +1,92 @@
 # CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI
 CrowPanel-Advance-7inch 3d printer controller
+FIRST I am not a programer! I am a copy cat, do what I read and am told to do.
+BUT what a world, with help from AI search and them spitting out code faster than you can read it!
+and most the time it even compiles. 
 
-Prints! Lots work to tie things together.
-Fill free to fork and Make it better!
+THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest and questions I will gladly answer.
+
+
+Prints! Lots of work to yet do to tie things together.
+Fill free to fork and Make it better for your personal use!
+
+My goal poasting is to get a work going to optimize the printers working ability
+FULL open source. 
+
+OK first all the readme below is AI generated, it does not reflect my ability. 
+
+These screens started with help from Gemini and Grok doing dark theme.
+
+In these files or lots of readme of this AI adventure. EEZ Studio Dark Theme UI.pdf alone has grew to over 300 pages.
+
+I was hoping AI, Gemini could read my files like a doctor, anylyize and spit out the cure.
+
+QUOTE from Gemini 11-21-2026  "—I don't have a tool to pull or browse files directly from GitHub repositories, so I can't open the whole repo on my own to do a full-repo diagnostic.
+What works just as well when you want a full "doctor's checkup" on the code is pasting the key files or sections directly here—especially main.cpp, actions.c, hmi_ui_sync.h, and the print_tools parts of screens.h and screens.c."
+
+Groks Answer:
+
+Yes — your GitHub repo is fully public and open.
+
+Anyone can view, clone, and fork it right now.It is extremely current.
+
+Last commit was today (November 21, 2026) — multiple updates in the last few hours, including “remove build folder”, README improvements, and “updated current running”. This is live, active work.Doctor’s Report: Project Health CheckPatient: CrowPanel-Advance-7inch-ESP32-S3-LVGL-ESP-IDF-Marlin-HMI
+
+Owner: carl1961 (Carl Shelton)
+
+Status: Work-in-progress 3D printer HMI for Marlin firmware on the Elecrow CrowPanel Advance 7" (800×480 RGB IPS + GT911 touch + ESP32-S3).Overall DiagnosisHealthy but still growing.
+
+This is a real, functional HMI that already talks to Marlin over UART, shows live temperatures, progress, coordinates, file browser, and has a proper dark-theme UI from EEZ Studio. It is not a toy demo — it has actual print control logic, progress estimation, and sync safeguards.You openly say “FIRST I am not a programer! I am a copy cat…” and credit AI (Grok + Gemini) heavily. That’s fine and honest. The code shows the classic AI-assisted pattern: solid structure in places, some repetition, and a few remaining rough edges that you’re already documenting in the README.Strengths (What’s Working Well)
+Architecture is sensible.
+
+FreeRTOS tasks for UART TX/RX, command queue, log queue, LVGL lock protection, watchdog that polls M105 if Marlin goes quiet. This is proper embedded practice.
+Temperature arc sync fix is smart.
+
+You added hmi_ui_sync.h + holdoff logic so the arcs don’t snap back while the user is dragging them. That was a real pain point and you fixed it properly with ui_should_ignore_nozzle_sync() / bed equivalent.
+Live data parsing is already quite complete:
+T: / B: temps + targets
+M27 byte progress
+M20 file list
+Coordinates (X: Y: Z:)
+Print start/end detection
+Fan PWM
+
+UI side is advanced. EEZ Studio project + generated screens, dark theme, multiple screens (main, print, file browser, etc.).
+Hardware support is solid. BM8563 RTC, STC8H1K28 IO expander/buzzer/backlight, GT911 touch, proper ESP-IDF 5.5.4 + LVGL setup.
+Weaknesses / Areas That Need Attention (the “symptoms”)
+Still unfinished (you already know this).
+
+README lists clear next steps:
+Guard M20/M21/M22 during active prints (status log gets flooded)
+Make sure X/Y/Z labels update reliably after screen changes
+Truncate long filenames so they don’t overlap the clock
+Clean remaining unused variable warnings
+
+Code quality is mixed (normal for AI-assisted + solo work).
+main.cpp is ~28 KB and does a lot — parsing, queues, timers, UI updates all in one place.
+Some C/C++ mixing (you already fixed the extern "C" linkage, good).
+UART is set to 115200 in the code I saw (common, but confirm it matches your Marlin baud).
+
+Documentation is honest but scattered.
+
+Top-level README is short + personal. The detailed architecture notes are good. There’s a huge “EEZ Studio Dark Theme UI.pdf” (300+ pages of the AI adventure) and a project tree. It’s more “working notes” than polished project docs.
+Repo hygiene.
+
+You just cleaned the build folder (good). There are still zip files of the project inside Firmware/. EEZ project file is large (~4 MB).
+PrognosisVery good.
+
+This is already more advanced than many public CrowPanel + Marlin HMI attempts. The core loop (UART ↔ LVGL ↔ Marlin) works, prints can be started from the screen, and the temperature interaction problem is solved. The remaining items are polish and robustness, not fundamental redesign.You are actively iterating (commits today), which is the healthiest sign.Recommendations (Doctor’s Orders)
+Keep the honest README style — it’s refreshing.
+Finish the three items already listed in “Next Steps”.
+Consider splitting main.cpp a bit more (parser vs. UI update helpers) when you have time.
+Add a simple CHANGELOG.md or keep updating the README with what works right now.
+Once the log flooding and coordinate updates are solid, this becomes a very usable open-source CrowPanel Marlin controller.
+Would you like me to dig deeper into any specific part (the temperature sync logic, the parser, the EEZ screens, the UART tasks, etc.) and give more targeted feedback or suggestions? Just say the word.
+
+
+
+
+
 ## Architecture, Temperature Sync & Build Notes
 
 ### Hardware & Firmware Architecture
