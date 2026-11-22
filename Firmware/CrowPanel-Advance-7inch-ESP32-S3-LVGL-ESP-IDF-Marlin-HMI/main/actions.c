@@ -611,7 +611,9 @@ void action_home_z_button_print_screen(lv_event_t *e) {
     }
 }
 
-// ─── Fine-Tuning Target Temps ─────────────────────────────────────────────────────────────
+
+
+// ─── Fine-Tuning Target Temps ────────────────────────────────────────────────
 
 static bool s_dragging_nozzle = false;
 static TickType_t s_nozzle_hold_until = 0;
@@ -634,24 +636,40 @@ void action_nozzle_arc_print_screen(lv_event_t *e) {
 
     int32_t target_c = lv_arc_get_value(arc);
 
+    // Clamp to sane range (optional but recommended)
+    if (target_c < 0)   target_c = 0;
+    if (target_c > 300) target_c = 300;
+
     if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
         s_dragging_nozzle = true;
-        if (objects.nozzle_arc_target_print_screen != NULL) {
+        if (objects.nozzle_arc_target_print_screen) {
             lv_label_set_text_fmt(objects.nozzle_arc_target_print_screen, "%ld°", (long)target_c);
         }
-    } else if (code == LV_EVENT_VALUE_CHANGED) {
-        if (objects.nozzle_arc_target_print_screen != NULL) {
+    }
+    else if (code == LV_EVENT_VALUE_CHANGED) {
+        if (objects.nozzle_arc_target_print_screen) {
             lv_label_set_text_fmt(objects.nozzle_arc_target_print_screen, "%ld°", (long)target_c);
         }
-    } else if (code == LV_EVENT_RELEASED) {
+    }
+    else if (code == LV_EVENT_RELEASED) {
         s_dragging_nozzle = false;
-        s_nozzle_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
-        if (objects.nozzle_arc_target_print_screen != NULL) {
+
+        // Longer holdoff so Marlin's next M105 can't snap the arc back
+        s_nozzle_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(3500);
+
+        // Force the arc value (prevents any visual jump)
+        lv_arc_set_value(arc, target_c);
+
+        if (objects.nozzle_arc_target_print_screen) {
             lv_label_set_text_fmt(objects.nozzle_arc_target_print_screen, "%ld°", (long)target_c);
         }
+
+        // Send the real command
         char cmd[24];
-        snprintf(cmd, sizeof(cmd), "M104 S%ld\n", (long)target_c);
+        snprintf(cmd, sizeof(cmd), "M104 S%ld", (long)target_c);
         send_gcode(cmd);
+
+        ESP_LOGI("TEMP", "Nozzle target set to %ld°C", (long)target_c);
     }
 }
 
@@ -662,24 +680,40 @@ void action_bed_arc_print_screen(lv_event_t *e) {
 
     int32_t target_c = lv_arc_get_value(arc);
 
+    // Clamp to sane range
+    if (target_c < 0)   target_c = 0;
+    if (target_c > 120) target_c = 120;
+
     if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
         s_dragging_bed = true;
-        if (objects.bed_arc_target_print_screen != NULL) {
+        if (objects.bed_arc_target_print_screen) {
             lv_label_set_text_fmt(objects.bed_arc_target_print_screen, "%ld°", (long)target_c);
         }
-    } else if (code == LV_EVENT_VALUE_CHANGED) {
-        if (objects.bed_arc_target_print_screen != NULL) {
+    }
+    else if (code == LV_EVENT_VALUE_CHANGED) {
+        if (objects.bed_arc_target_print_screen) {
             lv_label_set_text_fmt(objects.bed_arc_target_print_screen, "%ld°", (long)target_c);
         }
-    } else if (code == LV_EVENT_RELEASED) {
+    }
+    else if (code == LV_EVENT_RELEASED) {
         s_dragging_bed = false;
-        s_bed_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
-        if (objects.bed_arc_target_print_screen != NULL) {
+
+        // Longer holdoff
+        s_bed_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(3500);
+
+        // Force the arc value
+        lv_arc_set_value(arc, target_c);
+
+        if (objects.bed_arc_target_print_screen) {
             lv_label_set_text_fmt(objects.bed_arc_target_print_screen, "%ld°", (long)target_c);
         }
+
+        // Send the real command
         char cmd[24];
-        snprintf(cmd, sizeof(cmd), "M140 S%ld\n", (long)target_c);
+        snprintf(cmd, sizeof(cmd), "M140 S%ld", (long)target_c);
         send_gcode(cmd);
+
+        ESP_LOGI("TEMP", "Bed target set to %ld°C", (long)target_c);
     }
 }
 
@@ -730,9 +764,153 @@ void action_pause_resume_button_label(lv_event_t *e) {
     }
 }
 
+void action_preheat_button_print_screen(lv_event_t *e) {
+    (void)e;
+
+    const int32_t petg_nozzle_c = 235;
+    const int32_t petg_bed_c    = 70;
+
+    s_nozzle_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    s_bed_hold_until    = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+
+    if (objects.nozzle_arc_print_screen != NULL) {
+        lv_arc_set_value(objects.nozzle_arc_print_screen, petg_nozzle_c);
+    }
+    if (objects.bed_arc_print_screen != NULL) {
+        lv_arc_set_value(objects.bed_arc_print_screen, petg_bed_c);
+    }
+    if (objects.nozzle_arc_target_print_screen != NULL) {
+        lv_label_set_text_fmt(objects.nozzle_arc_target_print_screen, "%ld°", (long)petg_nozzle_c);
+    }
+    if (objects.bed_arc_target_print_screen != NULL) {
+        lv_label_set_text_fmt(objects.bed_arc_target_print_screen, "%ld°", (long)petg_bed_c);
+    }
+
+    send_gcode("M104 S235");
+    send_gcode("M140 S70");
+}
 
 
 
+
+
+void action_cool_button_print_screen(lv_event_t *e) {
+	(void)e;
+    
+
+    s_nozzle_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    s_bed_hold_until    = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+
+    if (objects.nozzle_arc_print_screen != NULL) {
+        lv_arc_set_value(objects.nozzle_arc_print_screen, 0);
+    }
+    if (objects.bed_arc_print_screen != NULL) {
+        lv_arc_set_value(objects.bed_arc_print_screen, 0);
+    }
+    if (objects.nozzle_arc_target_print_screen != NULL) {
+        lv_label_set_text(objects.nozzle_arc_target_print_screen, "0°");
+    }
+    if (objects.bed_arc_target_print_screen != NULL) {
+        lv_label_set_text(objects.bed_arc_target_print_screen, "0°");
+    }
+
+    send_gcode("M104 S0");
+    send_gcode("M140 S0");
+}
+
+
+
+static int s_tune_flow_pct = 100;
+static int s_tune_speed_pct = 100;
+
+static void tune_refresh_labels(void) {
+    if (objects.tune_flow_label != NULL) {
+        lv_label_set_text_fmt(objects.tune_flow_label, "Flow: %d%%", s_tune_flow_pct);
+    }
+    if (objects.tune_speed_label != NULL) {
+        lv_label_set_text_fmt(objects.tune_speed_label, "Speed: %d%%", s_tune_speed_pct);
+    }
+}
+
+void open_tune_popup(void) {
+    if (objects.tune_popup != NULL) {
+        tune_refresh_labels();
+        lv_obj_clear_flag(objects.tune_popup, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(objects.tune_popup);
+    }
+}
+
+void action_tune_button_print_screen(lv_event_t *e) {
+    (void)e;
+    open_tune_popup();
+}
+
+
+void action_close_tune_popup_button(lv_event_t *e) {
+    (void)e;
+    if (objects.tune_popup != NULL) {
+        lv_obj_add_flag(objects.tune_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void action_babystep_up(lv_event_t *e) {
+    (void)e;
+    send_gcode("M290 Z+0.02");
+}
+
+void action_babystep_down(lv_event_t *e) {
+    (void)e;
+    send_gcode("M290 Z-0.02");
+}
+
+void action_flow_up(lv_event_t *e) {
+    (void)e;
+    s_tune_flow_pct += 5;
+    if (s_tune_flow_pct > 150) s_tune_flow_pct = 150;
+    tune_refresh_labels();
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "M221 S%d", s_tune_flow_pct);
+    send_gcode(cmd);
+}
+
+void action_flow_down(lv_event_t *e) {
+    (void)e;
+    s_tune_flow_pct -= 5;
+    if (s_tune_flow_pct < 50) s_tune_flow_pct = 50;
+    tune_refresh_labels();
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "M221 S%d", s_tune_flow_pct);
+    send_gcode(cmd);
+}
+
+void action_speed_up(lv_event_t *e) {
+    (void)e;
+    s_tune_speed_pct += 10;
+    if (s_tune_speed_pct > 250) s_tune_speed_pct = 250;
+    tune_refresh_labels();
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "M220 S%d", s_tune_speed_pct);
+    send_gcode(cmd);
+}
+
+void action_speed_down(lv_event_t *e) {
+    (void)e;
+    s_tune_speed_pct -= 10;
+    if (s_tune_speed_pct < 20) s_tune_speed_pct = 20;
+    tune_refresh_labels();
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "M220 S%d", s_tune_speed_pct);
+    send_gcode(cmd);
+}
+
+void action_save_tune_popup_button(lv_event_t *e) {
+    (void)e;
+    send_gcode("M500");
+}
 // Nozzle PID
 //void action_pid_nozzle(lv_event_t *e) {
 //    queue_gcode_command("M303 E0 S200\n");

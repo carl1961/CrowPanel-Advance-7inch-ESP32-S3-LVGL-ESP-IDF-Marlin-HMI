@@ -341,6 +341,8 @@ static void file_browser_click_cb(lv_event_t *e) {
     show_print_confirmation(filename);
 }
 
+
+
 // ─── Marlin line parser ──────────────────────────────────────────────────────
 
 void parse_marlin_line(const char *line) {
@@ -506,8 +508,8 @@ void parse_marlin_line(const char *line) {
                 s_nozzle_target = hset;
 
                 if (!ui_should_ignore_nozzle_sync()) {
-                    if (objects.nozzle_arc) {
-                        lv_arc_set_value(objects.nozzle_arc, (int32_t)hset);
+                    if (objects.nozzle_arc_print_screen) {
+                        lv_arc_set_value(objects.nozzle_arc_print_screen, (int32_t)hset);
                     }
                     if (objects.nozzle_arc_target_print_screen) {
                         snprintf(buf, sizeof(buf), "%.0f°", hset);
@@ -540,8 +542,8 @@ void parse_marlin_line(const char *line) {
                 s_bed_target = bset;
 
                 if (!ui_should_ignore_bed_sync()) {
-                    if (objects.bed_arc) {
-                        lv_arc_set_value(objects.bed_arc, (int32_t)bset);
+                    if (objects.bed_arc_print_screen) {
+                        lv_arc_set_value(objects.bed_arc_print_screen, (int32_t)bset);
                     }
                     if (objects.bed_arc_target_print_screen) {
                         snprintf(buf, sizeof(buf), "%.0f°", bset);
