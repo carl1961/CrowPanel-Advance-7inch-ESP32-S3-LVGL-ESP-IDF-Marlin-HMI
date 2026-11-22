@@ -10,8 +10,9 @@ THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest 
 ********************************************************************************************************************************
 11-22-2026   Progess
 
-Grok, Fixed tempeture arcs on PRINTER SCREEN
+Grok, Fixed tempeture arcs on PRINTER SCREEN been weeks at getting this thing workin, then I asked grok! you canread hi comment below.
 
+<img width="744" height="452" alt="image" src="https://github.com/user-attachments/assets/389eb0cb-4b40-4e72-8431-b250ba48bb5a" />
 
 
 Gemini, Fixed Cool  button and Preheat for PetG, this gets temps up without having to spin arcs and you can then fin tune
