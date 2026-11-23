@@ -41,6 +41,9 @@ static int64_t s_start_us = 0;
 static bool s_is_paused = false;
 
 // Temperature & heating state tracking for M105 polling during heat-up
+
+extern "C" void filament_screen_update_temps(float current_t, float target_t);
+
 static float s_nozzle_current = 0.0f;
 static float s_nozzle_target  = 0.0f;
 static float s_bed_current    = 0.0f;
@@ -516,6 +519,12 @@ void parse_marlin_line(const char *line) {
                         lv_label_set_text(objects.nozzle_arc_target_print_screen, buf);
                     }
                 }
+            }
+			
+			// Keep Filament Change screen temp state & labels in sync with M105
+            if (s_nozzle_current >= 0.0f) {
+                float tgt_for_ui = (s_nozzle_target >= 0.0f) ? s_nozzle_target : 0.0f;
+                filament_screen_update_temps(s_nozzle_current, tgt_for_ui);
             }
         }
     }

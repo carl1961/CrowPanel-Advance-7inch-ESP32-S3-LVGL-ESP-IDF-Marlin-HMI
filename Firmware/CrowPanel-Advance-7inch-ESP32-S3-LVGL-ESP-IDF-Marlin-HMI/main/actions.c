@@ -532,6 +532,11 @@ void action_print_screen(lv_event_t * e) {
     loadScreen(SCREEN_ID_PRINT_SCREEN);
 }
 
+void action_jog_screen(lv_event_t * e) {
+    loadScreen(SCREEN_ID_JOG_SCREEN);
+}
+
+
 
 void action_job_label_print_screen(lv_event_t *e) {
     // TODO: Implement action job_label_print_screen here
@@ -911,6 +916,237 @@ void action_save_tune_popup_button(lv_event_t *e) {
     (void)e;
     send_gcode("M500");
 }
+
+
+// ============================================================================
+// FILAMENT CHANGE SCREEN (SCREEN_ID_FILAMENT_CHANGE_SCREEN = 6)
+// ============================================================================
+
+#define FILAMENT_MIN_EXTRUDE_TEMP  180.0f
+#define FILAMENT_LOAD_FAST_MM      60.0f
+#define FILAMENT_LOAD_PRIME_MM     20.0f
+#define FILAMENT_UNLOAD_TIP_MM      5.0f
+#define FILAMENT_UNLOAD_RETRACT_MM 75.0f
+
+static float s_filament_step_mm = 5.0f;
+static float s_filament_nozzle_cur = 0.0f;
+static float s_filament_nozzle_tgt = 0.0f;
+
+static void filament_set_status(const char *msg) {
+    if (objects.ready_label_filament_change_screen != NULL) {
+        lv_label_set_text(objects.ready_label_filament_change_screen, msg);
+    }
+}
+
+static void filament_highlight_step_buttons(void) {
+    struct {
+        lv_obj_t *btn;
+        float val;
+    } steps[] = {
+        { objects.steps_per_1mm_button_filament_change_screen,   1.0f },
+        { objects.steps_per_5mm_button_filament_change_screen,   5.0f },
+        { objects.steps_per_50mm_button_filament_change_screen, 50.0f },
+        { objects.steps_per_100mm_button_filament_change_screen, 100.0f },
+    };
+
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        if (steps[i].btn == NULL) continue;
+        bool active = (s_filament_step_mm == steps[i].val);
+        lv_obj_set_style_border_color(
+            steps[i].btn,
+            active ? lv_color_hex(0x00f4ff) : lv_color_hex(0x555555),
+            LV_PART_MAIN | LV_STATE_DEFAULT
+        );
+        lv_obj_set_style_border_width(
+            steps[i].btn,
+            active ? 2 : 1,
+            LV_PART_MAIN | LV_STATE_DEFAULT
+        );
+    }
+}
+
+// Call this from your M105 temperature update handler in main.cpp
+void filament_screen_update_temps(float current_t, float target_t) {
+    s_filament_nozzle_cur = current_t;
+    s_filament_nozzle_tgt = target_t;
+
+    char buf[16];
+
+    if (objects.nozzle_temp_label_filament_change_screen != NULL) {
+        snprintf(buf, sizeof(buf), "%.0f°", current_t);
+        lv_label_set_text(objects.nozzle_temp_label_filament_change_screen, buf);
+    }
+
+    if (objects.arc_temp_filament_change_screen != NULL) {
+        int32_t arc_val = (int32_t)(current_t + 0.5f);
+        if (arc_val < 0) arc_val = 0;
+        if (arc_val > 300) arc_val = 300;
+        lv_arc_set_value(objects.arc_temp_filament_change_screen, arc_val);
+    }
+
+    if (objects.temp_ok_label_filament_change_screen != NULL) {
+        if (current_t >= FILAMENT_MIN_EXTRUDE_TEMP) {
+            lv_label_set_text(objects.temp_ok_label_filament_change_screen, "TEMP OK");
+            lv_obj_set_style_text_color(
+                objects.temp_ok_label_filament_change_screen,
+                lv_color_hex(0x00f4ff),
+                LV_PART_MAIN | LV_STATE_DEFAULT
+            );
+        } else {
+            lv_label_set_text(objects.temp_ok_label_filament_change_screen, "COLD (<180C)");
+            lv_obj_set_style_text_color(
+                objects.temp_ok_label_filament_change_screen,
+                lv_color_hex(0xfba002),
+                LV_PART_MAIN | LV_STATE_DEFAULT
+            );
+        }
+    }
+}
+
+static bool filament_check_temp_ready(void) {
+    if (s_filament_nozzle_cur < FILAMENT_MIN_EXTRUDE_TEMP) {
+        filament_set_status("COLD - PREHEAT FIRST");
+        return false;
+    }
+    return true;
+}
+
+// --- Navigation ---
+
+void action_change_filament_button_print_screen(lv_event_t *e) {
+    (void)e;
+    filament_highlight_step_buttons();
+    filament_set_status("READY");
+    loadScreen(SCREEN_ID_FILAMENT_CHANGE_SCREEN);
+}
+
+void action_back_print_screen_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    loadScreen(SCREEN_ID_PRINT_SCREEN);
+}
+
+// --- Step Size Selection (1mm / 5mm / 50mm / 100mm) ---
+
+void action_steps_per_1mm_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    s_filament_step_mm = 1.0f;
+    filament_highlight_step_buttons();
+    filament_set_status("STEP: 1 MM");
+}
+
+void action_steps_per_5mm_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    s_filament_step_mm = 5.0f;
+    filament_highlight_step_buttons();
+    filament_set_status("STEP: 5 MM");
+}
+
+void action_steps_per_50mm_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    s_filament_step_mm = 50.0f;
+    filament_highlight_step_buttons();
+    filament_set_status("STEP: 50 MM");
+}
+
+void action_steps_per_100mm_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    s_filament_step_mm = 100.0f;
+    filament_highlight_step_buttons();
+    filament_set_status("STEP: 100 MM");
+}
+
+// --- Temperature Presets (PLA / PETG / Cooldown) ---
+
+void action_pla_temp_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M104 S210");
+    filament_set_status("HEATING PLA (210C)");
+}
+
+void action_petg_temp_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M104 S240");
+    filament_set_status("HEATING PETG (240C)");
+}
+
+void action_cooldown_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M104 S0");
+    filament_set_status("HEATER OFF");
+}
+
+// --- Manual Extrude / Retract (Uses Selected Step Size) ---
+
+void action_extrude_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    if (!filament_check_temp_ready()) return;
+
+    char cmd[32];
+    send_gcode("M83");
+    snprintf(cmd, sizeof(cmd), "G1 E%.1f F240", s_filament_step_mm);
+    send_gcode(cmd);
+    send_gcode("M82");
+
+    snprintf(cmd, sizeof(cmd), "EXTRUDE +%.0f MM", s_filament_step_mm);
+    filament_set_status(cmd);
+}
+
+void action_retract_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    if (!filament_check_temp_ready()) return;
+
+    char cmd[32];
+    send_gcode("M83");
+    snprintf(cmd, sizeof(cmd), "G1 E-%.1f F600", s_filament_step_mm);
+    send_gcode(cmd);
+    send_gcode("M82");
+
+    snprintf(cmd, sizeof(cmd), "RETRACT -%.0f MM", s_filament_step_mm);
+    filament_set_status(cmd);
+}
+
+// --- Automated Load / Unload Sequences ---
+
+void action_filament_load_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    if (!filament_check_temp_ready()) return;
+
+    char cmd[32];
+    send_gcode("M83");
+    snprintf(cmd, sizeof(cmd), "G1 E%.1f F600", FILAMENT_LOAD_FAST_MM);
+    send_gcode(cmd);
+    snprintf(cmd, sizeof(cmd), "G1 E%.1f F180", FILAMENT_LOAD_PRIME_MM);
+    send_gcode(cmd);
+    send_gcode("M82");
+
+    filament_set_status("LOADING FILAMENT...");
+}
+
+void action_filament_unload_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    if (!filament_check_temp_ready()) return;
+
+    char cmd[32];
+    send_gcode("M83");
+    snprintf(cmd, sizeof(cmd), "G1 E%.1f F200", FILAMENT_UNLOAD_TIP_MM);
+    send_gcode(cmd);
+    snprintf(cmd, sizeof(cmd), "G1 E-%.1f F1200", FILAMENT_UNLOAD_RETRACT_MM);
+    send_gcode(cmd);
+    send_gcode("M82");
+
+    filament_set_status("UNLOADING FILAMENT...");
+}
+
+// --- Emergency / Quick Stop for Extrude & Retract ---
+
+void action_stop_extrude_button_filament_change_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M410");
+    send_gcode("M82");
+    filament_set_status("STOPPED");
+}
+
+
 // Nozzle PID
 //void action_pid_nozzle(lv_event_t *e) {
 //    queue_gcode_command("M303 E0 S200\n");

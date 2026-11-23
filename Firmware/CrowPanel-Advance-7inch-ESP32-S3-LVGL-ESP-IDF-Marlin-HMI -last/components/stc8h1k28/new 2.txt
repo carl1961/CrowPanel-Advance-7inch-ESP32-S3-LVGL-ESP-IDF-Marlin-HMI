@@ -1,0 +1,21 @@
+static stc8h1k28_handle_t s_stc8 = NULL;
+
+esp_err_t stc8h1k28_init(i2c_master_bus_handle_t bus_handle, stc8h1k28_handle_t *extender_handle, const i2c_device_config_t *config) {
+    ESP_RETURN_ON_FALSE(bus_handle && extender_handle && config, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+
+    stc8h1k28_dev_t *dev = calloc(1, sizeof(stc8h1k28_dev_t));
+    ESP_RETURN_ON_FALSE(dev, ESP_ERR_NO_MEM, TAG, "Memory allocation failed");
+
+    ESP_RETURN_ON_ERROR(
+        i2c_master_bus_add_device(bus_handle, config, &dev->i2c_dev),
+        TAG, "Failed to add I2C device");
+
+    s_stc8 = dev;          // ← store handle
+    *extender_handle = dev;
+    ESP_LOGI(TAG, "stc8h1k28 initialized successfully");
+    return ESP_OK;
+}
+
+stc8h1k28_handle_t stc8h1k28_get_handle(void) {
+    return s_stc8;
+}   

@@ -29,7 +29,6 @@ extern void action_stepper_driver_screen(lv_event_t * e);
 extern void action_motion_screen(lv_event_t * e);
 extern void action_info_screen(lv_event_t * e);
 extern void action_screen_calibrate(lv_event_t * e);
-extern void action_back_main_print_screen_button(lv_event_t * e);
 extern void action_heat_nozzle_button(lv_event_t * e);
 extern void action_heat_bed_button(lv_event_t * e);
 extern void action_pid_nozzle_button(lv_event_t * e);
@@ -116,6 +115,27 @@ extern void action_flow_up(lv_event_t * e);
 extern void action_speed_down(lv_event_t * e);
 extern void action_speed_up(lv_event_t * e);
 extern void action_open_tune_popup(lv_event_t * e);
+extern void action_filament_load_button_filament_change_screen(lv_event_t * e);
+extern void action_filament_unload_button_filament_change_screen(lv_event_t * e);
+extern void action_steps_per_100mm_button_filament_change_screen(lv_event_t * e);
+extern void action_steps_per_50mm_button_filament_change_screen(lv_event_t * e);
+extern void action_steps_per_1mm_button_filament_change_screen(lv_event_t * e);
+extern void action_retract_button_filament_change_screen(lv_event_t * e);
+extern void action_extrude_button_filament_change_screen(lv_event_t * e);
+extern void action_nozzle_temp_label_filament_change_screen(lv_event_t * e);
+extern void action_arc_temp_filament_change_screen(lv_event_t * e);
+extern void action_temp_ok_label_filament_change_screen(lv_event_t * e);
+extern void action_back_print_screen_button_filament_change_screen(lv_event_t * e);
+extern void action_petg_temp_button_filament_change_screen(lv_event_t * e);
+extern void action_pla_temp_button_filament_change_screen(lv_event_t * e);
+extern void action_cooldown_button_filament_change_screen(lv_event_t * e);
+extern void action_back_main_button_info_screen(lv_event_t * e);
+extern void action_xtra_settings_screen(lv_event_t * e);
+extern void action_more_settings_screen(lv_event_t * e);
+extern void action_jog_screen_button_main_screen(lv_event_t * e);
+extern void action_jog_screen(lv_event_t * e);
+extern void action_steps_per_5mm_button_filament_change_screen(lv_event_t * e);
+extern void action_stop_extrude_button_filament_change_screen(lv_event_t * e);
 
 #ifdef __cplusplus
 }

@@ -18,6 +18,7 @@
     "fonts/ui_font_montserrat_bold_20.c",
     "fonts/ui_font_montserrat_bold_22.c",
     "fonts/ui_font_montserrat_bold_24.c",
+    "fonts/ui_font_montserrat_bold_32.c",
     "fonts/ui_font_montserrat_bold_38.c",
     "fonts/ui_font_montserrat_extra_bold_20.c",
     "images.c",
