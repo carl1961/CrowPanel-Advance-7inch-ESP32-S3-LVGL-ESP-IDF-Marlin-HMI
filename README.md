@@ -8,6 +8,15 @@ THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest 
 
 
 ********************************************************************************************************************************
+11-23-2026  Gemini Finished FILAMENT MANAGEMENT Screen
+
+<img width="743" height="452" alt="image" src="https://github.com/user-attachments/assets/ae5f052f-5c1c-4231-8c24-3fb3e1467281" />
+
+
+
+
+
+
 11-22-2026   Progess
 
 Grok, Fixed temperture arcs on PRINTER SCREEN been weeks at getting this thing working, then I asked grok! you can read his comment below.
