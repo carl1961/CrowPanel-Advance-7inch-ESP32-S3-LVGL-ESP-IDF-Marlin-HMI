@@ -7,10 +7,40 @@ and most the time it even compiles.
 THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest and questions I will gladly answer.
 
 
+********************************************************************************************************************************
+11-23-2026  Gemini Finished FILAMENT MANAGEMENT Screen
+
+<img width="743" height="452" alt="image" src="https://github.com/user-attachments/assets/ae5f052f-5c1c-4231-8c24-3fb3e1467281" />
+
+
+
+
+
+
+11-22-2026   Progess
+
+Grok, Fixed temperture arcs on PRINTER SCREEN been weeks at getting this thing working, then I asked grok! you can read his comment below.
+
+<img width="744" height="452" alt="image" src="https://github.com/user-attachments/assets/389eb0cb-4b40-4e72-8431-b250ba48bb5a" />
+
+
+Gemini, Fixed Cool  button and Preheat for PetG, this gets temps up without having to spin arcs and you can then fine tune
+Personally I quit using PLA after learning after a year no matter what you make breaks down and starts bio degrading.
+
+Gemini fixed and wired in the POPUP tune screen
+
+<img width="743" height="458" alt="image" src="https://github.com/user-attachments/assets/f311a8b6-225c-401d-8e3b-93ee0179a769" />
+
+every button worked!
+
+
+
+
+
 Prints! Lots of work to yet do to tie things together.
 Fill free to fork and Make it better for your personal use!
 
-My goal poasting is to get a work going to optimize the printers working ability
+My goal posting is to get a work going to optimize the printers working ability
 FULL open source. 
 
 OK first all the readme below is AI generated, it does not reflect my ability. 
