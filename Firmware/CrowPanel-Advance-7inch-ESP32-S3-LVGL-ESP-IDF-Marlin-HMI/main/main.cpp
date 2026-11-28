@@ -13,6 +13,8 @@
 #include "ui/screens.h"
 #include "stc8h1k28.h"
 #include "driver/uart.h"
+#include <math.h>
+#include "driver/gpio.h"
 
 extern "C" {
 #include "hmi_ui_sync.h"
@@ -29,9 +31,42 @@ extern "C" {
 #define LOG_LINE_MAX         512
 #define MAX_FILES            50
 #define FILE_NAME_LEN        64
+#define SFM27_CTRL_GPIO GPIO_NUM_8
+#define SFM27_BOOT_BEEP_MS      300
+#define SFM27_M500_BEEP_MS      600
 
 static const char *TAG = "MARLIN_HMI";
 
+
+extern "C" void jog_reset_z_homed(const char *reason);
+extern "C" void ui_show_save_eeprom_prompt(const char *reason);
+extern "C" void jog_screen_set_status(const char *msg);
+extern "C" void filament_screen_update_temps(float current_t, float target_t);
+
+static bool s_g34_running = false;
+static bool s_g29_running = false;
+static bool s_homing_active = false;
+static TickType_t s_homing_started_tick = 0;
+static stc8h1k28_handle_t stc8 = NULL;
+
+static bool s_m500_pending = false;
+
+/*
+static void buzzer_long_beep_task(void *arg) {
+    (void)arg;
+    if (stc8 != NULL) {
+        stc8h1k28_buzzer_on(stc8);
+        vTaskDelay(pdMS_TO_TICKS(600));
+        stc8h1k28_buzzer_off(stc8);
+    }
+    vTaskDelete(NULL);
+}
+
+static void trigger_m500_success_beep(void) {
+    if (stc8 == NULL) return;
+    xTaskCreate(buzzer_long_beep_task, "beep500", 1536, NULL, 2, NULL);
+}
+*/
 static void update_file_browser_ui(void);
 static float pos_x = 0.0f, pos_y = 0.0f, pos_z = 0.0f;
 
@@ -41,8 +76,6 @@ static int64_t s_start_us = 0;
 static bool s_is_paused = false;
 
 // Temperature & heating state tracking for M105 polling during heat-up
-
-extern "C" void filament_screen_update_temps(float current_t, float target_t);
 
 static float s_nozzle_current = 0.0f;
 static float s_nozzle_target  = 0.0f;
@@ -102,8 +135,6 @@ typedef struct {
 QueueHandle_t log_queue = NULL;
 QueueHandle_t marlin_cmd_queue = NULL;
 
-static stc8h1k28_handle_t stc8 = NULL;
-
 bool marlin_connected = false;
 bool isPrinting = false;
 uint32_t last_marlin_reply_ms = 0;
@@ -114,6 +145,7 @@ extern "C" {
     int file_count = 0;
 }
 static bool capturing_files = false;
+
 
 // Print progress state
 static uint32_t print_bytes_current = 0;
@@ -219,11 +251,86 @@ static void parse_fan_telemetry(const char *line) {
     }
 }
 
+// Buzzer SFM-27 DC: 3-24 V
+
+// Set to your free GPIO wired through 1 kOhm to the 2N2222 base (with 10 kOhm to GND)
+#ifndef SFM27_CTRL_GPIO
+#define SFM27_CTRL_GPIO   GPIO_NUM_NC
+#endif
+
+#define SFM27_M500_BEEP_MS      600
+
+static volatile bool s_sfm27_beep_running = false;
+
+static void sfm27_gpio_init(void) {
+    if (SFM27_CTRL_GPIO == GPIO_NUM_NC) {
+        ESP_LOGW(TAG, "SFM-27 GPIO not set; skipping init");
+        return;
+    }
+
+    gpio_config_t io_cfg = {
+        .pin_bit_mask = (1ULL << SFM27_CTRL_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t err = gpio_config(&io_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SFM-27 gpio_config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    gpio_set_level(SFM27_CTRL_GPIO, 0);
+}
+
+static void sfm27_m500_beep_task(void *arg) {
+    (void)arg;
+
+    if (SFM27_CTRL_GPIO != GPIO_NUM_NC) {
+        gpio_set_level(SFM27_CTRL_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(SFM27_M500_BEEP_MS));
+        gpio_set_level(SFM27_CTRL_GPIO, 0);
+    }
+
+    s_sfm27_beep_running = false;
+    vTaskDelete(NULL);
+}
+
+static void trigger_m500_success_beep(void) {
+    if (SFM27_CTRL_GPIO == GPIO_NUM_NC || s_sfm27_beep_running) {
+        return;
+    }
+
+    s_sfm27_beep_running = true;
+    BaseType_t ok = xTaskCreate(sfm27_m500_beep_task, "sfm27_m500", 2048, NULL, 2, NULL);
+    if (ok != pdPASS) {
+        s_sfm27_beep_running = false;
+        ESP_LOGW(TAG, "Failed to create sfm27_m500 task");
+    }
+}
+
 // ─── G-code send ─────────────────────────────────────────────────────────────
 
 extern "C" void send_gcode(const char *command) {
     if (!command || command[0] == '\0') return;
     record_outbound_temp_cmd(command);
+
+	if (strncmp(command, "M500", 4) == 0) {
+		s_m500_pending = true;
+	}
+
+    if (strncmp(command, "G28", 3) == 0) {
+        s_homing_active = true;
+        s_homing_started_tick = xTaskGetTickCount();
+    } else if (strncmp(command, "G34", 3) == 0) {
+        s_g34_running = true;
+        s_g29_running = false;
+    } else if (strncmp(command, "G29", 3) == 0) {
+        s_g29_running = true;
+        s_g34_running = false;
+    }
 
     if (marlin_cmd_queue != NULL) {
         xQueueSend(marlin_cmd_queue, command, pdMS_TO_TICKS(50));
@@ -350,7 +457,17 @@ static void file_browser_click_cb(lv_event_t *e) {
 
 void parse_marlin_line(const char *line) {
     if (line == NULL || line[0] == '\0') return;
-
+	
+	if (s_m500_pending) {
+		if (strstr(line, "Error:") != NULL || strstr(line, "err:") != NULL) {
+			s_m500_pending = false;
+		} else if (strstr(line, "Settings Stored") != NULL ||
+            strcmp(line, "ok") == 0 || strncmp(line, "ok ", 3) == 0) {
+			s_m500_pending = false;
+			trigger_m500_success_beep();
+		}
+	}
+	
     if (strstr(line, "External Reset") != NULL) {
         s_boot_usb_synced = false;
         isPrinting = false;
@@ -361,6 +478,8 @@ void parse_marlin_line(const char *line) {
         ui_set_print_active(false);
         ESP_LOGI(TAG, "Marlin External Reset detected -> will re-sync USB file list");
     }
+
+
 
     // Back off M27/M114 polling temporarily when Marlin reports busy (e.g., M190/M109/G28)
     if (strstr(line, "echo:busy: processing") != NULL) {
@@ -397,6 +516,55 @@ void parse_marlin_line(const char *line) {
             ESP_LOGI(TAG, "M27 progress: %lu / %lu", cur, tot);
         }
         return;
+    }
+
+
+    // Inside parse_marlin_line(const char *line) in main.cpp:
+	
+if (s_homing_active) {
+        if (strstr(line, "Error:") != NULL || strstr(line, "Homing Failed") != NULL) {
+            s_homing_active = false;
+            jog_screen_set_status("Homing failed");
+        } else if ((strcmp(line, "ok") == 0 || strncmp(line, "ok ", 3) == 0) &&
+                   (xTaskGetTickCount() - s_homing_started_tick) >= pdMS_TO_TICKS(1500)) {
+            s_homing_active = false;
+            if (objects.status_log_jog_screen) {
+                const char *cur = lv_textarea_get_text(objects.status_log_jog_screen);
+                if (cur && strncmp(cur, "Homing ", 7) == 0) {
+                    if (strstr(cur, "(G28 Z)") != NULL) {
+                        jog_screen_set_status("Homing Z complete");
+                    } else if (strstr(cur, "(G28 X)") != NULL) {
+                        jog_screen_set_status("Homing X complete");
+                    } else if (strstr(cur, "(G28 Y)") != NULL) {
+                        jog_screen_set_status("Homing Y complete");
+                    } else {
+                        jog_screen_set_status("Homing All complete");
+                    }
+                }
+            }
+        }
+    }
+
+    if (s_g34_running) {
+        if (strstr(line, "Error:") != NULL || strstr(line, "Homing Failed") != NULL) {
+            s_g34_running = false;
+            jog_screen_set_status("Z Auto-Align (G34) failed");
+        } else if (strcmp(line, "ok") == 0 || strncmp(line, "ok ", 3) == 0) {
+            s_g34_running = false;
+            jog_screen_set_status("Z Auto-Align (G34) complete");
+            ui_show_save_eeprom_prompt("Z Auto-Align complete");
+        }
+    }
+
+    if (s_g29_running) {
+        if (strstr(line, "Error:") != NULL || strstr(line, "Homing Failed") != NULL) {
+            s_g29_running = false;
+            jog_screen_set_status("Auto Bed Level (G29) failed");
+        } else if (strcmp(line, "ok") == 0 || strncmp(line, "ok ", 3) == 0) {
+            s_g29_running = false;
+            jog_screen_set_status("Auto Bed Level (G29) complete");
+            ui_show_save_eeprom_prompt("Bed leveling complete");
+        }
     }
 
     // M20 file list parsing
@@ -443,7 +611,9 @@ void parse_marlin_line(const char *line) {
 
     parse_fan_telemetry(line);
 
-    // Coordinate updates (main screen + print screen)
+ // Coordinate updates (main screen + print screen + jog screen)
+ 
+ 
     char coord_buf[16];
     const char *xPos = strstr(line, "X:");
     if (xPos && (xPos == line || xPos[-1] == ' ')) {
@@ -454,6 +624,9 @@ void parse_marlin_line(const char *line) {
             }
             if (objects.x_position_print_screen) {
                 lv_label_set_text(objects.x_position_print_screen, coord_buf);
+            }
+            if (objects.x_position_label_jog_screen) {
+                lv_label_set_text(objects.x_position_label_jog_screen, coord_buf);
             }
         }
     }
@@ -467,6 +640,9 @@ void parse_marlin_line(const char *line) {
             if (objects.y_position_print_screen) {
                 lv_label_set_text(objects.y_position_print_screen, coord_buf);
             }
+            if (objects.y_position_label_jog_screen) {
+                lv_label_set_text(objects.y_position_label_jog_screen, coord_buf);
+            }
         }
     }
     const char *zPos = strstr(line, "Z:");
@@ -478,6 +654,9 @@ void parse_marlin_line(const char *line) {
             }
             if (objects.z_position_print_screen) {
                 lv_label_set_text(objects.z_position_print_screen, coord_buf);
+            }
+            if (objects.z_position_label_jog_screen) {
+                lv_label_set_text(objects.z_position_label_jog_screen, coord_buf);
             }
         }
     }
@@ -630,6 +809,16 @@ static void marlin_rx_task(void *arg) {
                         if (lvgl_port_lock(100)) {
                             parse_marlin_line(line_accumulator);
 
+                            // Marlin boot / reset / halt / homing failure detection
+                            if (strstr(line_accumulator, "start") == line_accumulator ||
+                                strstr(line_accumulator, "Marlin ") != NULL ||
+                                strncmp(line_accumulator, "!!", 2) == 0 ||
+                                strstr(line_accumulator, "Error:") != NULL ||
+                                strstr(line_accumulator, "Homing Failed") != NULL ||
+                                strstr(line_accumulator, "Printer halted") != NULL) {
+                                jog_reset_z_homed("Z homed cleared (reset/error) - Home Z before Z-");
+                            }
+
                             if (strstr(line_accumulator, "T:") == NULL &&
                                 strcmp(line_accumulator, "ok") != 0 &&
                                 strncmp(line_accumulator, "ok ", 3) != 0 &&
@@ -752,12 +941,59 @@ static void update_print_screen_timer(lv_timer_t *timer) {
     ui_update_print_times(print_bytes_current, print_bytes_total);
 }
 
+static void ui_sync_all_coordinates(void) {
+    char buf[16];
+
+    snprintf(buf, sizeof(buf), "%.2f", pos_x);
+    if (objects.x_location_main_screen) {
+        lv_label_set_text(objects.x_location_main_screen, buf);
+    }
+    if (objects.x_position_print_screen) {
+        lv_label_set_text(objects.x_position_print_screen, buf);
+    }
+    if (objects.x_position_label_jog_screen) {
+        lv_label_set_text(objects.x_position_label_jog_screen, buf);
+    }
+
+    snprintf(buf, sizeof(buf), "%.2f", pos_y);
+    if (objects.y_location_main_screen) {
+        lv_label_set_text(objects.y_location_main_screen, buf);
+    }
+    if (objects.y_position_print_screen) {
+        lv_label_set_text(objects.y_position_print_screen, buf);
+    }
+    if (objects.y_position_label_jog_screen) {
+        lv_label_set_text(objects.y_position_label_jog_screen, buf);
+    }
+
+    snprintf(buf, sizeof(buf), "%.2f", pos_z);
+    if (objects.z_location_main_screen) {
+        lv_label_set_text(objects.z_location_main_screen, buf);
+    }
+    if (objects.z_position_print_screen) {
+        lv_label_set_text(objects.z_position_print_screen, buf);
+    }
+    if (objects.z_position_label_jog_screen) {
+        lv_label_set_text(objects.z_position_label_jog_screen, buf);
+    }
+}
+
+static void sfm27_pulse_ms(uint32_t duration_ms) {
+    if (SFM27_CTRL_GPIO == GPIO_NUM_NC) {
+        return;
+    }
+    gpio_set_level(SFM27_CTRL_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    gpio_set_level(SFM27_CTRL_GPIO, 0);
+}
+
 // ─── App main ────────────────────────────────────────────────────────────────
 
 extern "C" void app_main(void) {
     init_display();
     ESP_LOGI(TAG, "Start LVGL");
-
+    // 1. Initialize SFM-27 control pin low before display/LVGL/Marlin startup
+    sfm27_gpio_init();
     struct tm rtc_time = {};
     if (bm8563_get_time(rtc_handle, &rtc_time) == ESP_OK) {
         ESP_LOGI(TAG, "RTC: %04d-%02d-%02d %02d:%02d:%02d",
@@ -770,7 +1006,7 @@ extern "C" void app_main(void) {
 
     stc8 = stc8h1k28_get_handle();
     stc8h1k28_buzzer_on(stc8);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(500));
     stc8h1k28_buzzer_off(stc8);
 
     uart_config_t uart_config = {};
@@ -787,18 +1023,23 @@ extern "C" void app_main(void) {
     uart_flush_input(MARLIN_UART_NUM);
     log_queue_init();
     marlin_cmd_queue = xQueueCreate(COMMAND_QUEUE_LEN, MAX_GCODE_LEN);
+	
+// UI Init Display Screens
 
     if (lvgl_port_lock(portMAX_DELAY)) {
         ui_init();
-        if (objects.print_status_log) {
-            lv_textarea_set_text(objects.print_status_log, "");
-        }
-        if (objects.file_browser_list) {
-            lv_obj_add_event_cb(objects.file_browser_list, file_browser_click_cb, LV_EVENT_CLICKED, NULL);
-        }
-        if (objects.fan_speed_slider_print_screen) {
-            lv_obj_add_event_cb(objects.fan_speed_slider_print_screen, fan_slider_event_cb, LV_EVENT_ALL, NULL);
-        }
+	// 2. Short boot confirmation chirp on the 5V SFM-27
+    sfm27_pulse_ms(SFM27_BOOT_BEEP_MS);
+    	
+    if (objects.print_status_log) {
+        lv_textarea_set_text(objects.print_status_log, "");
+    }
+    if (objects.file_browser_list) {
+        lv_obj_add_event_cb(objects.file_browser_list, file_browser_click_cb, LV_EVENT_CLICKED, NULL);
+    }
+    if (objects.fan_speed_slider_print_screen) {
+        lv_obj_add_event_cb(objects.fan_speed_slider_print_screen, fan_slider_event_cb, LV_EVENT_ALL, NULL);
+    }
         lv_timer_create(update_clock_labels_timer, 1000, NULL);
         lv_timer_create(update_print_screen_timer, 1000, NULL);
         lvgl_port_unlock();
@@ -810,7 +1051,24 @@ extern "C" void app_main(void) {
 
     vTaskDelay(pdMS_TO_TICKS(1500));
 
+    
+ // Initialize position labels right after creating screens
+ 
+ 
+pos_x = 0.0f;
+    pos_y = 0.0f;
+    pos_z = 0.0f;
+
+    if (lvgl_port_lock(portMAX_DELAY)) {
+        ui_sync_all_coordinates();
+        lvgl_port_unlock();
+    }
+
     // Enable auto-report (primary method)
     send_gcode("M155 S2");
     vTaskDelay(pdMS_TO_TICKS(300));
+    send_gcode("M114");
+    vTaskDelay(pdMS_TO_TICKS(300));
+	
+
 }

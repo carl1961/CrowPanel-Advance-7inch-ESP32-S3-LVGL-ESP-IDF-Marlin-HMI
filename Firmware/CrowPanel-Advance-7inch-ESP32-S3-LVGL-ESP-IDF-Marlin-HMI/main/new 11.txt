@@ -1,0 +1,47 @@
+// Coordinate updates (main screen + print screen + jog screen)
+    char coord_buf[16];
+    const char *xPos = strstr(line, "X:");
+    if (xPos && (xPos == line || xPos[-1] == ' ')) {
+        if (sscanf(xPos, "X:%f", &pos_x) == 1) {
+            snprintf(coord_buf, sizeof(coord_buf), "%.2f", pos_x);
+            if (objects.x_location_main_screen) {
+                lv_label_set_text(objects.x_location_main_screen, coord_buf);
+            }
+            if (objects.x_position_print_screen) {
+                lv_label_set_text(objects.x_position_print_screen, coord_buf);
+            }
+            if (objects.x_position_label_jog_screen) {
+                lv_label_set_text(objects.x_position_label_jog_screen, coord_buf);
+            }
+        }
+    }
+    const char *yPos = strstr(line, "Y:");
+    if (yPos && (yPos == line || yPos[-1] == ' ')) {
+        if (sscanf(yPos, "Y:%f", &pos_y) == 1) {
+            snprintf(coord_buf, sizeof(coord_buf), "%.2f", pos_y);
+            if (objects.y_location_main_screen) {
+                lv_label_set_text(objects.y_location_main_screen, coord_buf);
+            }
+            if (objects.y_position_print_screen) {
+                lv_label_set_text(objects.y_position_print_screen, coord_buf);
+            }
+            if (objects.y_position_label_jog_screen) {
+                lv_label_set_text(objects.y_position_label_jog_screen, coord_buf);
+            }
+        }
+    }
+    const char *zPos = strstr(line, "Z:");
+    if (zPos && (zPos == line || zPos[-1] == ' ')) {
+        if (sscanf(zPos, "Z:%f", &pos_z) == 1) {
+            snprintf(coord_buf, sizeof(coord_buf), "%.2f", pos_z);
+            if (objects.z_location_main_screen) {
+                lv_label_set_text(objects.z_location_main_screen, coord_buf);
+            }
+            if (objects.z_position_print_screen) {
+                lv_label_set_text(objects.z_position_print_screen, coord_buf);
+            }
+            if (objects.z_position_label_jog_screen) {
+                lv_label_set_text(objects.z_position_label_jog_screen, coord_buf);
+            }
+        }
+    }

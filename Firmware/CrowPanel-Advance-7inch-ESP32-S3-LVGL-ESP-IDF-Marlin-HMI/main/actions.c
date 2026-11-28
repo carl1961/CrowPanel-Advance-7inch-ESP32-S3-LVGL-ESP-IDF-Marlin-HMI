@@ -20,13 +20,171 @@
 
 
 
-
-
-
-
-
-
 extern void send_gcode(const char *cmd);
+extern void jog_screen_set_status(const char *msg);
+
+static lv_obj_t *s_save_prompt_box = NULL;
+
+#define LOG_TEXTAREA_MAX_CHARS 2500
+#define LOG_TEXTAREA_TRIM_BATCH 500
+
+static bool is_routine_telemetry_line(const char *s) {
+    if (s == NULL || s[0] == '\0') return true;
+    if (strstr(s, "M105") != NULL) return true;
+    if (strncmp(s, "ok T:", 5) == 0 || strncmp(s, "T:", 2) == 0) return true;
+    if (strstr(s, "BD:") != NULL) return true;
+    return false;
+}
+
+static void cap_textarea_length(lv_obj_t *ta, size_t max_chars) {
+    if (ta == NULL) return;
+
+    const char *txt = lv_textarea_get_text(ta);
+    if (txt == NULL) return;
+
+    size_t len = strlen(txt);
+    if (len <= max_chars) return;
+
+    size_t to_remove = len - max_chars;
+    if (to_remove < LOG_TEXTAREA_TRIM_BATCH && len > LOG_TEXTAREA_TRIM_BATCH) {
+        to_remove = LOG_TEXTAREA_TRIM_BATCH;
+    }
+
+    size_t cut = to_remove;
+    while (cut < len && txt[cut - 1] != '\n') {
+        cut++;
+    }
+    if (cut > len) cut = len;
+
+    lv_textarea_set_cursor_pos(ta, 0);
+    for (size_t i = 0; i < cut; i++) {
+        lv_textarea_del_char_forward(ta);
+    }
+}
+
+static void append_and_scroll_textarea(lv_obj_t *ta, const char *msg) {
+    if (ta == NULL || msg == NULL || msg[0] == '\0') return;
+
+    cap_textarea_length(ta, LOG_TEXTAREA_MAX_CHARS);
+    lv_textarea_add_text(ta, msg);
+    lv_textarea_add_text(ta, "\n");
+    lv_textarea_set_cursor_pos(ta, LV_TEXTAREA_CURSOR_LAST);
+}
+
+void ui_report_marlin_status(const char *msg) {
+    if (msg == NULL || msg[0] == '\0' || is_routine_telemetry_line(msg)) {
+        return;
+    }
+
+    if (objects.print_status_log != NULL) {
+        append_and_scroll_textarea(objects.print_status_log, msg);
+    }
+    if (objects.print_status_log_print_screen != NULL) {
+        append_and_scroll_textarea(objects.print_status_log_print_screen, msg);
+    }
+    if (objects.status_log_jog_screen != NULL) {
+        lv_textarea_set_text(objects.status_log_jog_screen, msg);
+    }
+}
+
+
+
+static void save_prompt_btn_cb(lv_event_t *e) {
+    (void)e;
+    const char *action = (const char *)lv_event_get_user_data(e);
+
+    if (action != NULL && strcmp(action, "SAVE") == 0) {
+        jog_screen_set_status("Saving settings to EEPROM (M500)...");
+        send_gcode("M500");
+    }
+
+    if (s_save_prompt_box != NULL) {
+        lv_obj_del_async(s_save_prompt_box);
+        s_save_prompt_box = NULL;
+    }
+}
+
+void ui_show_save_eeprom_prompt(const char *reason) {
+    if (s_save_prompt_box != NULL) {
+        return; // Already open
+    }
+
+    lv_obj_t *parent = (objects.jog_screen != NULL) ? objects.jog_screen : lv_scr_act();
+    if (parent == NULL) {
+        return;
+    }
+
+    s_save_prompt_box = lv_obj_create(parent);
+    lv_obj_set_size(s_save_prompt_box, 360, 150);
+    lv_obj_center(s_save_prompt_box);
+    lv_obj_set_style_bg_color(s_save_prompt_box, lv_color_hex(0x1E242B), 0);
+    lv_obj_set_style_border_color(s_save_prompt_box, lv_color_hex(0x00F4FF), 0);
+    lv_obj_set_style_border_width(s_save_prompt_box, 2, 0);
+
+    lv_obj_t *lbl = lv_label_create(s_save_prompt_box);
+    lv_label_set_text_fmt(lbl, "%s\nSave to EEPROM (M500)?",
+                          (reason && reason[0]) ? reason : "Calibration complete.");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 14);
+
+    lv_obj_t *btn_save = lv_btn_create(s_save_prompt_box);
+    lv_obj_set_size(btn_save, 140, 44);
+    lv_obj_align(btn_save, LV_ALIGN_BOTTOM_LEFT, 20, -14);
+    lv_obj_set_style_bg_color(btn_save, lv_color_hex(0x008855), 0);
+    lv_obj_add_event_cb(btn_save, save_prompt_btn_cb, LV_EVENT_CLICKED, (void *)"SAVE");
+
+    lv_obj_t *lbl_save = lv_label_create(btn_save);
+    lv_label_set_text(lbl_save, "Save M500");
+    lv_obj_center(lbl_save);
+
+    lv_obj_t *btn_skip = lv_btn_create(s_save_prompt_box);
+    lv_obj_set_size(btn_skip, 140, 44);
+    lv_obj_align(btn_skip, LV_ALIGN_BOTTOM_RIGHT, -20, -14);
+    lv_obj_set_style_bg_color(btn_skip, lv_color_hex(0x444C56), 0);
+    lv_obj_add_event_cb(btn_skip, save_prompt_btn_cb, LV_EVENT_CLICKED, (void *)"SKIP");
+
+    lv_obj_t *lbl_skip = lv_label_create(btn_skip);
+    lv_label_set_text(lbl_skip, "Skip");
+    lv_obj_center(lbl_skip);
+}
+
+
+
+
+
+static bool s_z_homed = false;
+
+static void jog_update_z_up_state(void) {
+    if (objects.z_up_button_jog_screen == NULL) {
+        return;
+    }
+
+    if (s_z_homed) {
+        lv_obj_clear_state(objects.z_up_button_jog_screen, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(objects.z_up_button_jog_screen, LV_OPA_COVER,
+                             LV_PART_MAIN | LV_STATE_DEFAULT);
+    } else {
+        lv_obj_add_state(objects.z_up_button_jog_screen, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(objects.z_up_button_jog_screen, LV_OPA_40,
+                             LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
+
+void jog_mark_z_homed(bool homed) {
+    s_z_homed = homed;
+    jog_update_z_up_state();
+}
+
+void jog_reset_z_homed(const char *reason) {
+    s_z_homed = false;
+    jog_update_z_up_state();
+    if (reason != NULL && reason[0] != '\0' && objects.status_log_jog_screen != NULL) {
+        lv_textarea_set_text(objects.status_log_jog_screen, reason);
+    }
+}
+
+
+
 extern QueueHandle_t log_queue;
 
 typedef struct {
@@ -142,7 +300,7 @@ void update_clock_labels_timer(lv_timer_t * timer) {
 
 // Call this once after ui_init() in app_main:
 // lv_timer_create(update_clock_labels_timer, 1000, NULL);
-static const char *TAG_CAL = "CAL";
+// static const char *TAG_CAL = "CAL";
 
 static bool calibration_mode = false;
 static int cal_step = 0;
@@ -364,10 +522,6 @@ void action_on_cancel_calibration(lv_event_t *e) {
     loadScreen(SCREEN_ID_MAIN_SCREEN); 
 }
 
-// Helper – send a line to Marlin (adjust the serial port if needed)
-//static void send_gcode(const char *cmd) {
-    // UART transmission stub
-//}
 
 void action_show_gcode_popup(lv_event_t * e) {
     lv_obj_clear_flag(objects.gcode_popup, LV_OBJ_FLAG_HIDDEN);
@@ -459,7 +613,7 @@ void action_clear_log(lv_event_t * e) {
 }
 
 void action_power_off_button_main_screen(lv_event_t * e) {
-    // Add power off / M81 command logic if applicable
+    
 	send_gcode("M81");
 }
 
@@ -468,7 +622,7 @@ void action_go_back_folder(lv_event_t * e) {
 }
 
 void action_reboot_button_main_screen(lv_event_t * e) {
-    // Add reboot command logic
+    
 	send_gcode("M997");
 }
 
@@ -477,10 +631,7 @@ void action_reboot_button_main_screen(lv_event_t * e) {
 static int sort_mode = 0;
 
 void action_sort_files(lv_event_t * e) {
-    // Get the event object (the button) so we can update its label if desired
-    lv_obj_t * btn = lv_event_get_target(e);
-    
-    // Cycle through 3 different sort states on each press
+    (void)e;
     sort_mode = (sort_mode + 1) % 3;
 
     switch (sort_mode) {
@@ -495,7 +646,7 @@ void action_sort_files(lv_event_t * e) {
             ESP_LOGI("UI", "Sort Mode: Name Descending");
             break;
         case 2:
-            // Mode 2: Sort by Date/Time (or whatever alternate parameter your build supports)
+            // Mode 2: Sort by Date/Time
             send_gcode("M34 F-1 S1");
             ESP_LOGI("UI", "Sort Mode: Date/Time");
             break;
@@ -515,28 +666,6 @@ void action_usb_mount_button_main_screen(lv_event_t *e) {
         send_gcode("M21 U\n");
     }
 }
-
-void action_setting_screen(lv_event_t * e) {
-    loadScreen(SCREEN_ID_SETTING_SCREEN);
-}
-
-void action_screen_calibrate(lv_event_t * e) {
-    loadScreen(SCREEN_ID_SCREEN_CALIBRATE);
-}
-
-void action_main_screen(lv_event_t * e) {
-    loadScreen(SCREEN_ID_MAIN_SCREEN);
-}
-
-void action_print_screen(lv_event_t * e) {
-    loadScreen(SCREEN_ID_PRINT_SCREEN);
-}
-
-void action_jog_screen(lv_event_t * e) {
-    loadScreen(SCREEN_ID_JOG_SCREEN);
-}
-
-
 
 void action_job_label_print_screen(lv_event_t *e) {
     // TODO: Implement action job_label_print_screen here
@@ -819,8 +948,8 @@ void action_cool_button_print_screen(lv_event_t *e) {
         lv_label_set_text(objects.bed_arc_target_print_screen, "0°");
     }
 
-    send_gcode("M104 S0");
-    send_gcode("M140 S0");
+    send_gcode("M104 S0\n");
+    send_gcode("M140 S0\n");
 }
 
 
@@ -1147,12 +1276,359 @@ void action_stop_extrude_button_filament_change_screen(lv_event_t *e) {
 }
 
 
-// Nozzle PID
-//void action_pid_nozzle(lv_event_t *e) {
-//    queue_gcode_command("M303 E0 S200\n");
+// --- JOG SCREEN------
+
+static float s_jog_step = 0.1f;
+
+// Highlight the active step button with a cyan border (#00f4ff) and dim the others
+static void jog_update_step_highlights(void) {
+    lv_obj_t *btns[4] = {
+        objects.step_size_button_01_jog_screen,
+        objects.step_size_button_1mm_jog_screen,
+        objects.step_size_button_10mm_jog_screen,
+        objects.step_size_button_100mm_jog_screen
+    };
+    float vals[4] = { 0.1f, 1.0f, 10.0f, 100.0f };
+
+    for (int i = 0; i < 4; i++) {
+        if (btns[i] != NULL) {
+            bool active = (s_jog_step == vals[i]);
+            lv_obj_set_style_border_width(btns[i], active ? 2 : 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_color(
+                btns[i],
+                active ? lv_color_hex(0x00f4ff) : lv_color_hex(0x555555),
+                LV_PART_MAIN | LV_STATE_DEFAULT
+            );
+        }
+    }
+}
+
+// Call this whenever Marlin replies to M114, e.g. "X:123.45 Y:98.70 Z:15.20 E:0.00 Count X:..."
+void jog_screen_update_positions(float x, float y, float z) {
+    char buf[24];
+
+    if (objects.x_position_label_jog_screen != NULL) {
+        snprintf(buf, sizeof(buf), "%.2f", x);
+        lv_label_set_text(objects.x_position_label_jog_screen, buf);
+    }
+    if (objects.y_position_label_jog_screen != NULL) {
+        snprintf(buf, sizeof(buf), "%.2f", y);
+        lv_label_set_text(objects.y_position_label_jog_screen, buf);
+    }
+    if (objects.z_position_label_jog_screen != NULL) {
+        snprintf(buf, sizeof(buf), "%.2f", z);
+        lv_label_set_text(objects.z_position_label_jog_screen, buf);
+    }
+}
+
+// Helper to execute a single relative axis jog safely and query position
+static void jog_axis_relative(char axis, float delta, int feedrate) {
+    char cmd[48];
+    send_gcode("G91");
+    snprintf(cmd, sizeof(cmd), "G0 %c%.2f F%d", axis, delta, feedrate);
+    send_gcode(cmd);
+    send_gcode("G90");
+    send_gcode("M114");
+}
+
+// --- Step Size Buttons ---
+
+void action_step_size_button_01_jog_screen(lv_event_t *e) {
+    (void)e;
+    s_jog_step = 0.1f;
+    jog_update_step_highlights();
+}
+
+void action_step_size_button_1mm_jog_screen(lv_event_t *e) {
+    (void)e;
+    s_jog_step = 1.0f;
+    jog_update_step_highlights();
+}
+
+void action_step_size_button_10mm_jog_screen(lv_event_t *e) {
+    (void)e;
+    s_jog_step = 10.0f;
+    jog_update_step_highlights();
+}
+
+void action_step_size_button_100mm_jog_screen(lv_event_t *e) {
+    (void)e;
+    s_jog_step = 100.0f;
+    jog_update_step_highlights();
+}
+
+// --- Directional Jog Buttons ---
+
+void action_x_left_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_axis_relative('X', -s_jog_step, 3000);
+}
+
+void action_x_right_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_axis_relative('X', s_jog_step, 3000);
+}
+
+void action_y_up_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_axis_relative('Y', s_jog_step, 3000);
+}
+
+void action_y_down_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_axis_relative('Y', -s_jog_step, 3000);
+}
+
+// --- Z HotEnd crash protection ---
+
+// Helper to display status/errors in the Jog screen status box
+
+void jog_screen_set_status(const char *msg) {
+    if (msg == NULL) return;
+    if (objects.status_log_jog_screen == NULL) {
+        ESP_LOGW("JOG_LOG", "status_log_jog_screen is NULL; msg='%s'", msg);
+        return;
+    }
+    ESP_LOGI("JOG_LOG", "Setting status_log_jog_screen: %s", msg);
+    lv_textarea_set_text(objects.status_log_jog_screen, msg);
+}
+
+
+void action_z_up_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    if (!s_z_homed) {
+        jog_screen_set_status("BLOCKED: Home Z (G28 Z) before raising bed (Z-)");
+        return;
+    }
+    // Cap toward-nozzle (Z-) jogs at 10mm for safety
+    float z_step = (s_jog_step > 10.0f) ? 10.0f : s_jog_step;
+    jog_axis_relative('Z', -z_step, 600);
+}
+
+void action_z_down_button_jog_screen(lv_event_t *e) {
+    (void)e;
+	float z_step = s_jog_step;
+    // Allow full step up to 100mm when moving bed down (Z+) away from nozzle
+    jog_axis_relative('Z', z_step, 600);
+}
+
+// --- Homing, Calibration & Motors ---
+
+void action_x_home_button_jog_screen(lv_event_t *e) {
+    (void)e;
+	jog_screen_set_status("Homing X (G28 X)...");
+    send_gcode("G28 X");
+    send_gcode("M114");
+}
+
+void action_y_home_button_jog_screen(lv_event_t *e) {
+    (void)e;
+	jog_screen_set_status("Homing Y (G28 Y)...");
+    send_gcode("G28 Y");
+    send_gcode("M114");
+}
+
+void action_z_home_button_jog_screen(lv_event_t *e) {
+    (void)e;
+	s_z_homed = true;
+    jog_screen_set_status("Homing Z (G28 Z)...");
+    send_gcode("G28 Z");
+    send_gcode("M114");
+	
+}
+
+void action_all_home_button_jog_screen(lv_event_t *e) {
+    (void)e;
+	s_z_homed = true;
+	jog_screen_set_status("Homing All (G28)...");
+    send_gcode("G28");
+    send_gcode("M114");
+	
+}
+
+
+
+void action_z_auto_align_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_screen_set_status("Running Z Auto-Align (G34)...");
+    send_gcode("G34");
+    send_gcode("M114");
+}
+
+void action_auto_bed_level_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_screen_set_status("Running Auto Bed Level (G29)...");
+    send_gcode("G29");
+    send_gcode("M114");
+}
+
+// Save Auto-Bed Level mesh & Z-offset to EEPROM
+void action_save_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_screen_set_status("Saving settings to EEPROM (M500)...");
+    send_gcode("M500");
+}
+
+void action_motors_off_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M84\n");
+}
+
+
+
+// --- Navigation ---
+
+void action_back_main_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    // Switch back to your main/console screen here, e.g.:
+     loadScreen(SCREEN_ID_MAIN_SCREEN);
+}
+
+void action_z_auto_align_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("G34\n");
+}
+
+void action_auto_bed_level_button_jog_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("G29\n");
+}
+
+void jog_screen_on_enter(void) {
+    s_jog_step = 0.1f;
+    jog_update_step_highlights();
+
+    if (objects.jog_screen != NULL) {
+        lv_scr_load(objects.jog_screen);
+    }
+
+    send_gcode("M114");
+}
+
+void action_jog_screen(lv_event_t *e) {
+    (void)e;
+    jog_screen_on_enter();
+}
+
+
+void action_save_settings_button_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M500\n");
+}
+
+
+void action_restore_printer_settings_button_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M501\n");
+}
+
+
+void action_default_printer_settings_button_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M502\n");
+}
+
+void action_save_button_more_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M500\n");
+}
+
+void action_load_defaults_button_more_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M502\n");
+}
+
+void action_load_defaults_button_xtra_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M502\n");
+}
+
+void action_save_button_xtra_settings_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M500\n");
+}
+
+void action_load_defaults_button_motion_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M502\n");
+}
+
+void action_save_button_motion_screen(lv_event_t *e) {
+    (void)e;
+    send_gcode("M500\n");
+}
+
+void action_setting_screen(lv_event_t * e) {
+    loadScreen(SCREEN_ID_SETTING_SCREEN);
+}
+
+void action_screen_calibrate(lv_event_t * e) {
+    loadScreen(SCREEN_ID_SCREEN_CALIBRATE);
+}
+
+void action_main_screen(lv_event_t * e) {
+    loadScreen(SCREEN_ID_MAIN_SCREEN);
+}
+
+void action_print_screen(lv_event_t * e) {
+    loadScreen(SCREEN_ID_PRINT_SCREEN);
+}
+
+void action_motion_screen(lv_event_t *e) {
+    (void)e;
+    // Switch back to your main/console screen here, e.g.:
+     loadScreen(SCREEN_ID_MOTION_SCREEN);
+}
+
+
+void action_more_settings_screen(lv_event_t *e) {
+    (void)e;
+    // Switch back to your main/console screen here, e.g.:
+     loadScreen(SCREEN_ID_MORE_SETTINGS_SCREEN);
+}
+
+
+void action_xtra_settings_screen(lv_event_t *e) {
+    (void)e;
+    // Switch back to your main/console screen here, e.g.:
+     loadScreen(SCREEN_ID_XTRA_SETTINGS_SCREEN);
+}
+
+
+
+
+
+void action_info_screen(lv_event_t *e) {
+    (void)e;
+    // Switch back to your main/console screen here, e.g.:
+     loadScreen(SCREEN_ID_INFO_SCREEN);
+}
+
+
+//void action_time_date_setting_screen(lv_event_t *e) {
+//    (void)e;
+//    // Switch back to your main/console screen here, e.g.:
+//     loadScreen(SCREEN_ID_TIME_DATE_SETTINGS_SCREEN);
 //}
 
+
+//void action_jog_screen(lv_event_t *e) {
+//    (void)e;
+//    // Switch back to your main/console screen here, e.g.:
+//     loadScreen(SCREEN_ID_JOG_SCREEN);
+//}
+
+
+
+
+
+
+// Nozzle PID
+void action_manual_hotend_pid_button_settings_screen(lv_event_t *e) {
+    send_gcode("M303 E0 S200\n");
+}
+
 // Bed PID
-//void action_pid_bed(lv_event_t *e) {
-//    queue_gcode_command("M303 E-1 S60\n");
-//}   
+void action_manual_bed_pid_button_settings_screen(lv_event_t *e) {
+    send_gcode("M303 E-1 S60\n");
+}   

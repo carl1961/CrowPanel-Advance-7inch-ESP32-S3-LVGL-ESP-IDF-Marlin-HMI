@@ -25,6 +25,7 @@ extern const lv_font_t ui_font_montserrat_bold_24;
 extern const lv_font_t ui_font_font_awesome5_solid_60;
 extern const lv_font_t ui_font_font_awesome5_solid_44;
 extern const lv_font_t ui_font_font_awesome5_solid_40;
+extern const lv_font_t ui_font_montserrat_bold_32;
 
 #ifndef EXT_FONT_DESC_T
 #define EXT_FONT_DESC_T

@@ -41,6 +41,9 @@ static int64_t s_start_us = 0;
 static bool s_is_paused = false;
 
 // Temperature & heating state tracking for M105 polling during heat-up
+
+extern "C" void filament_screen_update_temps(float current_t, float target_t);
+
 static float s_nozzle_current = 0.0f;
 static float s_nozzle_target  = 0.0f;
 static float s_bed_current    = 0.0f;
@@ -440,7 +443,7 @@ void parse_marlin_line(const char *line) {
 
     parse_fan_telemetry(line);
 
-    // Coordinate updates (main screen + print screen)
+ // Coordinate updates (main screen + print screen + jog screen)
     char coord_buf[16];
     const char *xPos = strstr(line, "X:");
     if (xPos && (xPos == line || xPos[-1] == ' ')) {
@@ -451,6 +454,9 @@ void parse_marlin_line(const char *line) {
             }
             if (objects.x_position_print_screen) {
                 lv_label_set_text(objects.x_position_print_screen, coord_buf);
+            }
+            if (objects.x_position_label_jog_screen) {
+                lv_label_set_text(objects.x_position_label_jog_screen, coord_buf);
             }
         }
     }
@@ -464,6 +470,9 @@ void parse_marlin_line(const char *line) {
             if (objects.y_position_print_screen) {
                 lv_label_set_text(objects.y_position_print_screen, coord_buf);
             }
+            if (objects.y_position_label_jog_screen) {
+                lv_label_set_text(objects.y_position_label_jog_screen, coord_buf);
+            }
         }
     }
     const char *zPos = strstr(line, "Z:");
@@ -475,6 +484,9 @@ void parse_marlin_line(const char *line) {
             }
             if (objects.z_position_print_screen) {
                 lv_label_set_text(objects.z_position_print_screen, coord_buf);
+            }
+            if (objects.z_position_label_jog_screen) {
+                lv_label_set_text(objects.z_position_label_jog_screen, coord_buf);
             }
         }
     }
@@ -516,6 +528,12 @@ void parse_marlin_line(const char *line) {
                         lv_label_set_text(objects.nozzle_arc_target_print_screen, buf);
                     }
                 }
+            }
+			
+			// Keep Filament Change screen temp state & labels in sync with M105
+            if (s_nozzle_current >= 0.0f) {
+                float tgt_for_ui = (s_nozzle_target >= 0.0f) ? s_nozzle_target : 0.0f;
+                filament_screen_update_temps(s_nozzle_current, tgt_for_ui);
             }
         }
     }
@@ -742,6 +760,43 @@ static void update_print_screen_timer(lv_timer_t *timer) {
 
     ui_update_print_times(print_bytes_current, print_bytes_total);
 }
+	
+static void ui_sync_all_coordinates(void) {
+    char buf[16];
+
+    snprintf(buf, sizeof(buf), "%.2f", pos_x);
+    if (objects.x_location_main_screen) {
+        lv_label_set_text(objects.x_location_main_screen, buf);
+    }
+    if (objects.x_position_print_screen) {
+        lv_label_set_text(objects.x_position_print_screen, buf);
+    }
+    if (objects.x_position_label_jog_screen) {
+        lv_label_set_text(objects.x_position_label_jog_screen, buf);
+    }
+
+    snprintf(buf, sizeof(buf), "%.2f", pos_y);
+    if (objects.y_location_main_screen) {
+        lv_label_set_text(objects.y_location_main_screen, buf);
+    }
+    if (objects.y_position_print_screen) {
+        lv_label_set_text(objects.y_position_print_screen, buf);
+    }
+    if (objects.y_position_label_jog_screen) {
+        lv_label_set_text(objects.y_position_label_jog_screen, buf);
+    }
+
+    snprintf(buf, sizeof(buf), "%.2f", pos_z);
+    if (objects.z_location_main_screen) {
+        lv_label_set_text(objects.z_location_main_screen, buf);
+    }
+    if (objects.z_position_print_screen) {
+        lv_label_set_text(objects.z_position_print_screen, buf);
+    }
+    if (objects.z_position_label_jog_screen) {
+        lv_label_set_text(objects.z_position_label_jog_screen, buf);
+    }
+}
 
 // ─── App main ────────────────────────────────────────────────────────────────
 
@@ -761,7 +816,7 @@ extern "C" void app_main(void) {
 
     stc8 = stc8h1k28_get_handle();
     stc8h1k28_buzzer_on(stc8);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(500));
     stc8h1k28_buzzer_off(stc8);
 
     uart_config_t uart_config = {};
@@ -778,6 +833,8 @@ extern "C" void app_main(void) {
     uart_flush_input(MARLIN_UART_NUM);
     log_queue_init();
     marlin_cmd_queue = xQueueCreate(COMMAND_QUEUE_LEN, MAX_GCODE_LEN);
+	
+// UI Init Display Screens
 
     if (lvgl_port_lock(portMAX_DELAY)) {
         ui_init();
@@ -801,7 +858,46 @@ extern "C" void app_main(void) {
 
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    // Enable auto-report (primary method)
+    
+	pos_x = 0.0f;
+	pos_y = 0.0f;
+	pos_z = 0.0f;
+
+	if (objects.x_location_main_screen) {
+    lv_label_set_text(objects.x_location_main_screen, "0.00");
+	}
+	if (objects.y_location_main_screen) {
+    lv_label_set_text(objects.y_location_main_screen, "0.00");
+	}
+	if (objects.z_location_main_screen) {
+    lv_label_set_text(objects.z_location_main_screen, "0.00");
+	}
+
+	if (objects.x_position_print_screen) {
+    lv_label_set_text(objects.x_position_print_screen, "0.00");
+	}
+	if (objects.y_position_print_screen) {
+    lv_label_set_text(objects.y_position_print_screen, "0.00");
+	}
+	if (objects.z_position_print_screen) {
+    lv_label_set_text(objects.z_position_print_screen, "0.00");
+	}
+
+	if (objects.x_position_label_jog_screen) {
+    lv_label_set_text(objects.x_position_label_jog_screen, "0.00");
+	}
+	if (objects.y_position_label_jog_screen) {
+    lv_label_set_text(objects.y_position_label_jog_screen, "0.00");
+	}
+	if (objects.z_position_label_jog_screen) {
+    lv_label_set_text(objects.z_position_label_jog_screen, "0.00");
+	}
+	
+	
+	// Enable auto-report (primary method)
     send_gcode("M155 S2");
     vTaskDelay(pdMS_TO_TICKS(300));
-}
+	send_gcode("M114");
+    vTaskDelay(pdMS_TO_TICKS(300));
+	
+}                

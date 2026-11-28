@@ -1,9 +1,9 @@
 {
   "navigation": {
     "selectedUserPageObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/5",
-    "selectedActionObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/actions/68",
+    "selectedActionObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/actions/128",
     "selectedStyleObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/lvglStyles/styles/12",
-    "selectedFontObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/fonts/17",
+    "selectedFontObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/fonts/18",
     "selectedBitmapObject": "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/bitmaps/5",
     "subnavigationSelectedItems": {
       "variables-tab/sub-navigation/selected-item": "Global"
@@ -122,12 +122,13 @@
             {
               "type": "row",
               "id": "#985feec8-2184-43a6-8dcc-81c3f87ce502",
-              "weight": 15,
+              "weight": 24.07441867998251,
               "children": [
                 {
                   "type": "tabset",
                   "id": "#b08f76da-2958-41fe-8dc0-63e60a9a3540",
                   "weight": 0.9391304347826087,
+                  "selected": 2,
                   "enableClose": false,
                   "children": [
                     {
@@ -170,8 +171,7 @@
                       "enableClose": false,
                       "icon": "svg:hierarchy"
                     }
-                  ],
-                  "active": true
+                  ]
                 },
                 {
                   "type": "tabset",
@@ -194,13 +194,13 @@
             {
               "type": "tabset",
               "id": "EDITORS",
-              "weight": 53.40148698884759,
+              "weight": 50.41901280566514,
               "enableDeleteWhenEmpty": false,
               "enableClose": false,
               "children": [
                 {
                   "type": "tab",
-                  "id": "#dc00b1b3-a0e9-4aef-a707-9fa76766da81",
+                  "id": "#b0943b7d-2d27-4d34-8dad-3fb576e3d5c4",
                   "name": "FilamentChangeScreen",
                   "component": "editor",
                   "config": {
@@ -214,12 +214,12 @@
             {
               "type": "row",
               "id": "#30b0cd7c-f9d3-41dd-9639-7bff8ecfaa56",
-              "weight": 31.598513011152416,
+              "weight": 25.506568514352345,
               "children": [
                 {
                   "type": "tabset",
                   "id": "#f1d7446c-29dd-44e6-bb48-ce9545e2f0d9",
-                  "weight": 2.483528161530287,
+                  "weight": 1.2417640807651436,
                   "children": [
                     {
                       "type": "tab",
@@ -229,12 +229,13 @@
                       "enableClose": false,
                       "icon": "svg:properties"
                     }
-                  ]
+                  ],
+                  "active": true
                 },
                 {
                   "type": "tabset",
                   "id": "#98f570f7-693d-43e0-a89e-e6d44575d097",
-                  "weight": 0.5164718384697131,
+                  "weight": 1.2417640807651436,
                   "children": [
                     {
                       "type": "tab",
@@ -1103,7 +1104,7 @@
       "transform": {
         "translate": {
           "x": -406.28631591796875,
-          "y": -332.9045410156249
+          "y": -442.44905079213595
         },
         "scale": 1
       },
@@ -1121,9 +1122,7 @@
           "0": {
             "0": {}
           },
-          "1": {
-            "$selected": true
-          },
+          "1": {},
           "2": {},
           "3": {},
           "4": {},
@@ -1146,13 +1145,16 @@
           "49": {},
           "50": {},
           "53": {},
-          "54": {}
+          "54": {},
+          "58": {
+            "2": {}
+          }
         }
       },
       "transform": {
         "translate": {
           "x": -402.09552001953125,
-          "y": -439.41943276103024
+          "y": -329.8749229845192
         },
         "scale": 1
       },
@@ -1235,7 +1237,7 @@
       "transform": {
         "translate": {
           "x": -400,
-          "y": -359.0890195530221
+          "y": -30.45549022348895
         },
         "scale": 1
       },
@@ -1251,9 +1253,9 @@
       "selectionBack": {
         "0": {
           "0": {},
-          "2": {
-            "$selected": true
-          },
+          "2": {},
+          "3": {},
+          "6": {},
           "14": {},
           "15": {},
           "16": {},
@@ -1265,13 +1267,19 @@
           "23": {},
           "24": {},
           "25": {},
-          "31": {}
+          "26": {
+            "$selected": true
+          },
+          "29": {},
+          "30": {},
+          "32": {},
+          "35": {}
         }
       },
       "transform": {
         "translate": {
           "x": -407.76361083984375,
-          "y": -216.95004272460938
+          "y": -323.2082213243626
         },
         "scale": 1
       },
@@ -1351,13 +1359,14 @@
           "0": {},
           "2": {
             "0": {}
-          }
+          },
+          "38": {}
         }
       },
       "transform": {
         "translate": {
           "x": -334.94585693359375,
-          "y": -459.0890195530221
+          "y": -240
         },
         "scale": 1
       },
@@ -1405,7 +1414,10 @@
       "selectionFront": {},
       "selectionBack": {
         "0": {
-          "0": {}
+          "0": {},
+          "30": {
+            "$selected": true
+          }
         }
       },
       "transform": {
@@ -1430,6 +1442,9 @@
             "0": {}
           },
           "1": {},
+          "2": {
+            "$selected": true
+          },
           "6": {},
           "7": {},
           "10": {},
@@ -1452,7 +1467,11 @@
     },
     "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/11[flow-state]": {
       "selectionFront": {},
-      "selectionBack": {},
+      "selectionBack": {
+        "0": {
+          "2": {}
+        }
+      },
       "transform": {
         "translate": {
           "x": -400,
@@ -1469,7 +1488,11 @@
     },
     "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/12[flow-state]": {
       "selectionFront": {},
-      "selectionBack": {},
+      "selectionBack": {
+        "0": {
+          "3": {}
+        }
+      },
       "transform": {
         "translate": {
           "x": -400,
@@ -1486,7 +1509,13 @@
     },
     "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/13[flow-state]": {
       "selectionFront": {},
-      "selectionBack": {},
+      "selectionBack": {
+        "0": {
+          "2": {
+            "$selected": true
+          }
+        }
+      },
       "transform": {
         "translate": {
           "x": -400,
@@ -1504,19 +1533,29 @@
     "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/14[flow-state]": {
       "selectionFront": {},
       "selectionBack": {
-        "0": {
-          "0": {},
-          "23": {
-            "0": {
-              "$selected": true
-            }
-          }
-        }
+        "0": {}
       },
       "transform": {
         "translate": {
           "x": -400,
-          "y": -240
+          "y": -130.45549022348894
+        },
+        "scale": 1
+      },
+      "timeline": {
+        "isEditorActive": false,
+        "position": 0,
+        "secondToPx": 200,
+        "scrollLeft": 0
+      }
+    },
+    "[EEZ_Studio_Crowpanel_Marlin_HMI.eez-project]:/userPages/15[flow-state]": {
+      "selectionFront": {},
+      "selectionBack": {},
+      "transform": {
+        "translate": {
+          "x": -400,
+          "y": 88.63352932953316
         },
         "scale": 1
       },
@@ -1547,12 +1586,11 @@
     "TEXT",
     "BACKGROUND",
     "BORDER",
-    "MISCELLANEOUS",
-    "PADDING"
+    "MISCELLANEOUS"
   ],
   "showInactiveFlowsInDebugger": true,
   "globalFlowZoom": true,
   "flowZoom": 1,
   "implementationLanguage": "C",
-  "openDialogDefaultPath": "C:\\Users\\cmshe\\eez-projects\\fonts\\Font-Awesome-5.x\\webfonts\\fa-solid-900.woff"
+  "openDialogDefaultPath": "C:\\Users\\cmshe\\eez-projects\\fonts\\Montserrat\\static\\Montserrat-Bold.ttf"
 }
