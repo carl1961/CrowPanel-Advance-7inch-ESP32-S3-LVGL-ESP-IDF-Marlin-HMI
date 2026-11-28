@@ -8,6 +8,29 @@ THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest 
 
 
 ********************************************************************************************************************************
+11-28-2026
+
+## Recent Firmware Updates
+
+### 1. Homing Status Persistence & Jog Safety (`main.cpp` & `actions.c`)
+* **Persistent Homing Status:** Tracked `G28` commands via `s_homing_active` and `s_homing_started_tick` in `main.cpp` so `"Homing All (G28)..."` (and X/Y/Z homing prompts) stay displayed on `status_log_jog_screen` until homing completes after the minimum elapsed window (`1500 ms`+) or reports a homing/error state.
+* **Removed Premature Coordinate Overrides:** Removed duplicate `strncmp` homing-completion checks above the `X:`/`Y:`/`Z:` coordinate parser in `parse_marlin_line()` so position updates refresh axis labels without prematurely flipping the homing status message.
+* **Z-Homed Guard:** Kept `jog_mark_z_homed(true)` on Z and All homing actions (`action_z_home_button_jog_screen`, `action_all_home_button_jog_screen`) while leaving X-only and Y-only homes from falsely marking Z homed, and preserved `lift_z_before_home()` on Print screen home actions.
+
+### 2. EEPROM Save (`M500`) Long Buzzer Beep (`main.cpp`)
+* **Centralized `M500` Tracking:** Flagged outbound `M500` commands in `send_gcode()` with `s_m500_pending` so save buttons across screens (Jog, Tune popup, and the EEPROM save prompt) trigger a single notification path.
+* **Non-Blocking Long Beep:** When Marlin confirms `M500` (`Settings Stored` or `ok` without error), `trigger_m500_success_beep()` spawns a short-lived FreeRTOS task (`buzzer_long_beep_task`) to sound the STC8H1K28 buzzer for `600 ms` via `stc8h1k28_buzzer_on()` / `stc8h1k28_buzzer_off()` without blocking LVGL or UART RX.
+
+### 3. Console Telemetry Filtering & Log Stability (`actions.c` & `main.cpp`)
+* **Telemetry Filter:** Filtered routine `M105`, `ok T:`, `T:`, and `BD:` (`//action:notification BD:...mm`) lines out of `ui_report_marlin_status()` via `is_routine_telemetry_line()` so BDsensor distance streaming and temperature polls do not flood the UI logs.
+* **Bounded Log Textareas:** Capped `print_status_log` and `print_status_log_print_screen` (`LOG_TEXTAREA_MAX_CHARS = 2500`, `LOG_TEXTAREA_TRIM_BATCH = 500`), trimming old text on newline boundaries and auto-scrolling to the latest line.
+* **G-Code Popup & Code Cleanup:** Added `-` support on the G-code keypad map (`gcode_map`) for negative coordinates/offsets and removed duplicate declarations and unused/commented stubs in `main.cpp` and `actions.c`.
+
+### 4. SFM-27 3-24v
+* Added external buzzer, Onboard buzzer hard to hear whe display is in 3D Printer case
+
+
+
 11-23-2026  Gemini Finished FILAMENT MANAGEMENT Screen
 
 <img width="743" height="452" alt="image" src="https://github.com/user-attachments/assets/ae5f052f-5c1c-4231-8c24-3fb3e1467281" />
