@@ -28,7 +28,7 @@ THIS is not a tutor of how to get EZZ Studio or ESP-IDF rolling. but any reqest 
 
 ### 4. SFM-27 3-24v
 * Added a external buzzer, Onboard buzzer hard to hear when display is mounted in 3D Printer case.
-* 
+* Used the Wireless Module header Gnd and IO8. So it's running on the 3.3v from pin IO8, and it loud enough.
 <img width="787" height="721" alt="image" src="https://github.com/user-attachments/assets/29e60911-fe99-41dc-9f75-ba8885a625b2" />
 <img width="822" height="589" alt="image" src="https://github.com/user-attachments/assets/39ee67d2-8010-46f6-80d7-02cfee6ce0cc" />
 
